@@ -1,0 +1,1062 @@
+"""Interview session manager bridges frontend with LangGraph execution.
+
+Supports two modes:
+  - practice:     Quick practice with reference answers in the report
+  - professional: Dual-round interview (Round 1: depth, Round 2: breadth)
+                  with resume analysis and detailed evaluation
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Literal
+
+from langgraph.graph import END, StateGraph
+
+from app.cache.locks import session_answer_lock
+from app.cache.session_cache import save_session_report, save_session_snapshot
+from app.agents.evaluator import evaluate_interview, evaluate_practice, summarize_round1
+from app.agents.interviewer import (
+    advance_question,
+    ask_follow_up,
+    ask_question,
+    assess_answer,
+    route_after_assessment,
+)
+from app.agents.jd_analyst import analyze_jd
+from app.agents.parallel_prep import parallel_analyze
+from app.agents.question_planner import (
+    plan_questions,
+    plan_questions_round2,
+    plan_questions_with_resume,
+)
+from app.agents.state import InterviewState
+from app.memory.service import get_memory_service
+from app.models.interview import AnswerAssessment, ChatMessage, InterviewSession
+from app.models.question import QuestionItem
+from app.models.report import InterviewReport, PracticeReport, ProfessionalReport
+from app.models.resume import ResumeParseResult
+from app.services.checkpoint import get_checkpointer
+from app.services.session_repository import (
+    PersistedSession,
+    list_session_records_for_user,
+    load_session_record,
+    save_session_record,
+)
+from app.streaming import (
+    SessionEventBus,
+    reset_stream_sink,
+    set_stream_sink,
+)
+
+logger = logging.getLogger(__name__)
+
+StreamSink = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+@dataclass
+class _SessionData:
+    """Internal bookkeeping for a live interview session."""
+
+    session: InterviewSession
+    mode: Literal["practice", "professional"] = "practice"
+    resume_text: str = ""
+    resume_parse_result: ResumeParseResult | None = None
+    report: InterviewReport | None = None
+    professional_report: ProfessionalReport | None = None
+    practice_report: PracticeReport | None = None
+    user_id: str = "local-user"
+    persisted_assessment_count: int = 0
+    final_memory_saved: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    graph_started: bool = False
+    last_state: dict[str, Any] = field(default_factory=dict)
+    error_message: str | None = None
+    event_bus: SessionEventBus = field(default_factory=SessionEventBus)
+    start_task: asyncio.Task | None = None
+    answer_task: asyncio.Task | None = None
+    active_operation: Literal["start", "answer"] | None = None
+    active_answer_id: str | None = None
+    last_answer_id: str | None = None
+    last_answer_result: dict[str, Any] | None = None
+
+
+class SessionManager:
+    """Manages interview sessions and drives the LangGraph execution.
+
+    Each session gets its own LangGraph thread_id so checkpoint state
+    is isolated. Separate graphs are compiled for practice and professional modes.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, _SessionData] = {}
+        self._checkpointer = get_checkpointer()
+        self._practice_graph = self._build_graph("practice")
+        self._professional_graph = self._build_graph("professional")
+
+    # Graph construction
+
+    def _build_graph(self, mode: str):
+        graph = StateGraph(InterviewState)
+
+        if mode == "professional":
+            graph.add_node("parallel_analyze", parallel_analyze)
+            graph.add_node("plan_questions_round1", plan_questions_with_resume)
+
+            graph.add_node("ask_question", ask_question)
+            graph.add_node("ask_follow_up", ask_follow_up)
+            graph.add_node("assess_answer", assess_answer)
+            graph.add_node("advance_question", advance_question)
+
+            graph.add_node("summarize_round1", summarize_round1)
+            graph.add_node("plan_questions_round2", plan_questions_round2)
+            graph.add_node("evaluate", evaluate_interview)
+
+            graph.set_entry_point("parallel_analyze")
+            graph.add_edge("parallel_analyze", "plan_questions_round1")
+            graph.add_edge("plan_questions_round1", "ask_question")
+
+            graph.add_edge("ask_question", "assess_answer")
+            graph.add_edge("ask_follow_up", "assess_answer")
+            graph.add_conditional_edges(
+                "assess_answer",
+                route_after_assessment,
+                {
+                    "ask_follow_up": "ask_follow_up",
+                    "ask_question": "advance_question",
+                    "summarize_round1": "summarize_round1",
+                    "evaluate": "evaluate",
+                },
+            )
+            graph.add_edge("advance_question", "ask_question")
+
+            graph.add_edge("summarize_round1", "plan_questions_round2")
+            graph.add_edge("plan_questions_round2", "ask_question")
+            graph.add_edge("evaluate", END)
+        else:
+            graph.add_node("analyze_jd", analyze_jd)
+            graph.add_node("plan_questions", plan_questions)
+            graph.add_node("evaluate", evaluate_practice)
+
+            graph.add_node("ask_question", ask_question)
+            graph.add_node("ask_follow_up", ask_follow_up)
+            graph.add_node("assess_answer", assess_answer)
+            graph.add_node("advance_question", advance_question)
+
+            graph.set_entry_point("analyze_jd")
+            graph.add_edge("analyze_jd", "plan_questions")
+            graph.add_edge("plan_questions", "ask_question")
+            graph.add_edge("ask_question", "assess_answer")
+            graph.add_edge("ask_follow_up", "assess_answer")
+            graph.add_conditional_edges(
+                "assess_answer",
+                route_after_assessment,
+                {
+                    "ask_follow_up": "ask_follow_up",
+                    "ask_question": "advance_question",
+                    "evaluate": "evaluate",
+                },
+            )
+            graph.add_edge("advance_question", "ask_question")
+            graph.add_edge("evaluate", END)
+
+        compiled = graph.compile(
+            interrupt_before=["assess_answer"],
+            checkpointer=self._checkpointer,
+        )
+        logger.info("SessionManager: %s graph compiled", mode)
+        return compiled
+
+    def _get_graph(self, mode: str):
+        return self._practice_graph if mode == "practice" else self._professional_graph
+
+    # Session CRUD
+
+    def create_session(
+        self,
+        session_id: str,
+        jd_text: str,
+        max_follow_ups: int = 2,
+        mode: Literal["practice", "professional"] = "practice",
+        resume_text: str = "",
+        resume_parse_result: ResumeParseResult | None = None,
+        user_id: str = "local-user",
+    ) -> InterviewSession:
+        session = InterviewSession(
+            session_id=session_id,
+            user_id=user_id,
+            jd_text=jd_text,
+            max_follow_ups=max_follow_ups,
+        )
+        data = _SessionData(
+            session=session,
+            mode=mode,
+            resume_text=resume_text,
+            resume_parse_result=resume_parse_result,
+            user_id=user_id,
+        )
+        self._sessions[session_id] = data
+        logger.info(
+            "Session created: %s (mode=%s, resume=%d chars)",
+            session_id,
+            mode,
+            len(resume_text),
+        )
+        return session
+
+    def get_session(self, session_id: str) -> InterviewSession | None:
+        data = self._sessions.get(session_id)
+        return data.session if data else None
+
+    async def ensure_session_loaded(self, session_id: str) -> InterviewSession | None:
+        """Load session metadata from persistent storage when memory is empty."""
+        data = self._sessions.get(session_id)
+        if data:
+            return data.session
+
+        persisted = await load_session_record(session_id)
+        if not persisted:
+            return None
+
+        self._sessions[session_id] = _SessionData(
+            session=persisted.session,
+            mode=persisted.mode,  # type: ignore[arg-type]
+            resume_text=persisted.resume_text,
+            resume_parse_result=persisted.resume_parse_result,
+            user_id=persisted.session.user_id,
+            graph_started=persisted.graph_started,
+            last_state=persisted.last_state or {},
+            persisted_assessment_count=persisted.persisted_assessment_count,
+            final_memory_saved=persisted.final_memory_saved,
+            error_message=persisted.error_message,
+        )
+        logger.info("Restored session metadata from Postgres: %s", session_id)
+        return persisted.session
+
+    async def list_user_sessions(
+        self,
+        user_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return lightweight session summaries for one user."""
+        summaries_by_id: dict[str, dict[str, Any]] = {}
+
+        persisted_rows = await list_session_records_for_user(
+            user_id,
+            limit=limit + offset,
+            offset=0,
+        )
+        for persisted in persisted_rows:
+            summaries_by_id[persisted.session.session_id] = self._session_summary_from_persisted(
+                persisted
+            )
+
+        for data in self._sessions.values():
+            if data.session.user_id != user_id:
+                continue
+            summaries_by_id[data.session.session_id] = self._session_summary_from_data(data)
+
+        summaries = list(summaries_by_id.values())
+        summaries.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
+        return summaries[offset : offset + limit]
+
+    def _session_summary_from_persisted(self, persisted: PersistedSession) -> dict[str, Any]:
+        session = persisted.session
+        last_state = persisted.last_state or {}
+        return self._build_session_summary(
+            session=session,
+            mode=persisted.mode,
+            graph_started=persisted.graph_started,
+            last_state=last_state,
+            error_message=persisted.error_message,
+            created_at=persisted.created_at,
+            updated_at=persisted.updated_at,
+            completed_at=persisted.completed_at,
+        )
+
+    def _session_summary_from_data(self, data: _SessionData) -> dict[str, Any]:
+        return self._build_session_summary(
+            session=data.session,
+            mode=data.mode,
+            graph_started=data.graph_started,
+            last_state=data.last_state,
+            error_message=data.error_message,
+            created_at=None,
+            updated_at=None,
+            completed_at=None,
+        )
+
+    def _build_session_summary(
+        self,
+        *,
+        session: InterviewSession,
+        mode: str,
+        graph_started: bool,
+        last_state: dict[str, Any],
+        error_message: str | None,
+        created_at: Any | None,
+        updated_at: Any | None,
+        completed_at: Any | None,
+    ) -> dict[str, Any]:
+        report = (
+            last_state.get("practice_report")
+            or last_state.get("professional_report")
+            or last_state.get("final_report")
+        )
+        question_count = self._count_questions(last_state)
+        assessment_count = len(last_state.get("assessments", []) or session.assessments or [])
+        title = self._session_title(session.jd_text)
+        return {
+            "session_id": session.session_id,
+            "title": title,
+            "mode": mode,
+            "status": session.status,
+            "graph_started": graph_started,
+            "has_report": bool(report or session.status == "completed"),
+            "question_count": question_count,
+            "assessment_count": assessment_count,
+            "current_question_index": session.current_question_index,
+            "max_follow_ups": session.max_follow_ups,
+            "jd_preview": self._text_preview(session.jd_text, 180),
+            "overall_score": self._report_value(report, "overall_score"),
+            "grade": self._report_value(report, "grade"),
+            "error_message": error_message,
+            "created_at": self._iso_or_none(created_at),
+            "updated_at": self._iso_or_none(updated_at),
+            "completed_at": self._iso_or_none(completed_at),
+        }
+
+    def _count_questions(self, state: dict[str, Any]) -> int:
+        plans = [
+            state.get("question_plan", []),
+            state.get("round1_question_plan", []),
+            state.get("round2_question_plan", []),
+        ]
+        return sum(len(plan or []) for plan in plans)
+
+    def _session_title(self, jd_text: str) -> str:
+        for line in jd_text.splitlines():
+            text = line.strip(" #：:")
+            if text:
+                return self._text_preview(text, 36)
+        return "未命名面试"
+
+    def _text_preview(self, text: str, length: int) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= length:
+            return compact
+        return compact[: length - 1].rstrip() + "..."
+
+    def _report_value(self, report: Any, key: str) -> Any:
+        if not report:
+            return None
+        if isinstance(report, dict):
+            return report.get(key)
+        return getattr(report, key, None)
+
+    def _iso_or_none(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
+    def get_session_mode(self, session_id: str) -> str:
+        data = self._sessions.get(session_id)
+        return data.mode if data else "practice"
+
+    def update_session_status(self, session_id: str, status: str) -> None:
+        data = self._sessions.get(session_id)
+        if data:
+            data.session.status = status
+            self._schedule_persist(session_id)
+
+    def set_resume(
+        self,
+        session_id: str,
+        resume_text: str,
+        resume_parse_result: ResumeParseResult | None = None,
+    ) -> None:
+        """Attach parsed resume content before the graph starts."""
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+        if data.graph_started:
+            raise RuntimeError("Resume cannot be changed after the interview has started")
+        data.resume_text = resume_text
+        data.resume_parse_result = resume_parse_result
+        self._schedule_persist(session_id)
+
+    def get_resume_parse_result(self, session_id: str) -> ResumeParseResult | None:
+        data = self._sessions.get(session_id)
+        return data.resume_parse_result if data else None
+
+    def has_graph_started(self, session_id: str) -> bool:
+        data = self._sessions.get(session_id)
+        return bool(data and data.graph_started)
+
+    def save_report(self, session_id: str, report: InterviewReport) -> None:
+        data = self._sessions.get(session_id)
+        if data:
+            data.report = report
+            data.session.status = "completed"
+            self._schedule_persist(session_id)
+
+    def save_professional_report(self, session_id: str, report: ProfessionalReport) -> None:
+        data = self._sessions.get(session_id)
+        if data:
+            data.professional_report = report
+            data.session.status = "completed"
+            self._schedule_persist(session_id)
+
+    def save_practice_report(self, session_id: str, report: PracticeReport) -> None:
+        data = self._sessions.get(session_id)
+        if data:
+            data.practice_report = report
+            data.session.status = "completed"
+            self._schedule_persist(session_id)
+
+    def get_report(self, session_id: str) -> InterviewReport | None:
+        data = self._sessions.get(session_id)
+        return data.report if data else None
+
+    def get_professional_report(self, session_id: str) -> ProfessionalReport | None:
+        data = self._sessions.get(session_id)
+        return data.professional_report if data else None
+
+    def get_practice_report(self, session_id: str) -> PracticeReport | None:
+        data = self._sessions.get(session_id)
+        return data.practice_report if data else None
+
+    def get_report_for_session(
+        self,
+        session_id: str,
+    ) -> PracticeReport | ProfessionalReport | InterviewReport | dict | None:
+        data = self._sessions.get(session_id)
+        if not data:
+            return None
+        if data.mode == "practice":
+            return (
+                data.practice_report
+                or self._report_from_last_state(session_id, "practice_report", PracticeReport)
+                or data.report
+                or self._report_from_last_state(session_id, "final_report", InterviewReport)
+            )
+        return (
+            data.professional_report
+            or self._report_from_last_state(session_id, "professional_report", ProfessionalReport)
+            or data.report
+            or self._report_from_last_state(session_id, "final_report", InterviewReport)
+        )
+
+    def _report_from_last_state(self, session_id: str, key: str, model_cls: type) -> Any:
+        data = self._sessions.get(session_id)
+        if not data:
+            return None
+        raw_report = (data.last_state or {}).get(key)
+        if not raw_report:
+            return None
+        if isinstance(raw_report, model_cls):
+            return raw_report
+        try:
+            restored = model_cls.model_validate(raw_report)
+        except Exception:
+            logger.debug(
+                "Returning raw report from last_state: session=%s key=%s",
+                session_id,
+                key,
+            )
+            return raw_report
+
+        if key == "practice_report":
+            data.practice_report = restored
+        elif key == "professional_report":
+            data.professional_report = restored
+        elif key == "final_report":
+            data.report = restored
+        return restored
+
+    async def get_last_state(self, session_id: str) -> dict[str, Any]:
+        data = self._sessions.get(session_id)
+        if not data:
+            return {}
+        graph_state = await self.get_graph_state(session_id)
+        if graph_state:
+            self._sync_session_from_state(session_id, graph_state)
+            return graph_state
+        return data.last_state
+
+    def _sync_session_from_state(self, session_id: str, state: dict | None) -> None:
+        """Mirror LangGraph state into lightweight session metadata."""
+        if not state:
+            return
+        data = self._sessions.get(session_id)
+        if not data:
+            return
+
+        state_dict = dict(state)
+        data.last_state = state_dict
+
+        session = data.session
+        session.current_question_index = int(
+            state_dict.get("current_question_index", session.current_question_index) or 0
+        )
+        session.follow_up_count = int(
+            state_dict.get("follow_up_count", session.follow_up_count) or 0
+        )
+
+        history = []
+        for raw_msg in state_dict.get("conversation_history", []) or []:
+            try:
+                if isinstance(raw_msg, ChatMessage):
+                    history.append(raw_msg)
+                else:
+                    history.append(ChatMessage.model_validate(raw_msg))
+            except Exception:
+                logger.debug("Skipped invalid chat message in session=%s: %r", session_id, raw_msg)
+        session.conversation_history = history
+
+        assessments = []
+        for raw_assessment in state_dict.get("assessments", []) or []:
+            try:
+                assessments.append(
+                    raw_assessment
+                    if isinstance(raw_assessment, AnswerAssessment)
+                    else AnswerAssessment.model_validate(raw_assessment)
+                )
+            except Exception:
+                logger.debug(
+                    "Skipped invalid assessment in session=%s: %r",
+                    session_id,
+                    raw_assessment,
+                )
+        session.assessments = assessments
+
+        if state_dict.get("interview_complete"):
+            session.status = "completed"
+
+    async def _cache_runtime_state(self, session_id: str, state: dict | None) -> None:
+        if not state:
+            return
+        data = self._sessions.get(session_id)
+        if not data:
+            return
+        await self._persist_session(session_id)
+        await save_session_snapshot(
+            data.session,
+            dict(state),
+            mode=data.mode,
+            graph_started=data.graph_started,
+        )
+        report = (
+            state.get("practice_report")
+            or state.get("professional_report")
+            or state.get("final_report")
+            or self.get_report_for_session(session_id)
+        )
+        if report:
+            await save_session_report(session_id, report)
+
+    # LangGraph execution helpers
+
+    def _config(self, session_id: str) -> dict:
+        return {"configurable": {"thread_id": session_id}}
+
+    def subscribe_events(self, session_id: str) -> asyncio.Queue[dict[str, Any]]:
+        """Subscribe to live events for a session."""
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+        return data.event_bus.subscribe()
+
+    def unsubscribe_events(
+        self,
+        session_id: str,
+        queue: asyncio.Queue[dict[str, Any]],
+    ) -> None:
+        data = self._sessions.get(session_id)
+        if data:
+            data.event_bus.unsubscribe(queue)
+
+    def has_active_operation(self, session_id: str) -> bool:
+        data = self._sessions.get(session_id)
+        if not data:
+            return False
+        return bool(
+            (data.start_task and not data.start_task.done())
+            or (data.answer_task and not data.answer_task.done())
+        )
+
+    def ensure_start_task(self, session_id: str) -> asyncio.Task:
+        """Start one background graph run for WebSocket consumers."""
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+        if data.graph_started:
+            raise RuntimeError("Interview graph has already started")
+        if data.start_task and not data.start_task.done():
+            return data.start_task
+
+        data.active_operation = "start"
+
+        async def run() -> dict:
+            try:
+                return await self.start_interview_graph(
+                    session_id,
+                    stream_sink=data.event_bus.publish,
+                )
+            finally:
+                if data.active_operation == "start":
+                    data.active_operation = None
+
+        task = asyncio.create_task(run(), name=f"interview-start:{session_id}")
+        data.start_task = task
+        return task
+
+    def ensure_answer_task(
+        self,
+        session_id: str,
+        answer: str,
+        answer_id: str,
+    ) -> asyncio.Task:
+        """Submit one answer exactly once within the current process."""
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+
+        if data.answer_task and not data.answer_task.done():
+            if data.active_answer_id == answer_id:
+                return data.answer_task
+            raise RuntimeError("Another answer is already being processed")
+
+        if data.last_answer_id == answer_id and data.last_answer_result is not None:
+            async def return_cached() -> dict[str, Any]:
+                return data.last_answer_result or {}
+
+            return asyncio.create_task(
+                return_cached(),
+                name=f"interview-answer-cached:{session_id}",
+            )
+
+        data.active_operation = "answer"
+        data.active_answer_id = answer_id
+
+        async def run() -> dict:
+            try:
+                result = await self.submit_answer(
+                    session_id,
+                    answer,
+                    stream_sink=data.event_bus.publish,
+                )
+                data.last_answer_id = answer_id
+                data.last_answer_result = result
+                return result
+            finally:
+                data.active_answer_id = None
+                if data.active_operation == "answer":
+                    data.active_operation = None
+
+        task = asyncio.create_task(run(), name=f"interview-answer:{session_id}")
+        data.answer_task = task
+        return task
+
+    async def _persist_session(self, session_id: str) -> None:
+        data = self._sessions.get(session_id)
+        if not data:
+            return
+        try:
+            await save_session_record(
+                session=data.session,
+                mode=data.mode,
+                resume_text=data.resume_text,
+                resume_parse_result=data.resume_parse_result,
+                graph_started=data.graph_started,
+                last_state=data.last_state,
+                persisted_assessment_count=data.persisted_assessment_count,
+                final_memory_saved=data.final_memory_saved,
+                error_message=data.error_message,
+            )
+        except Exception:
+            logger.exception("Failed to persist session metadata: %s", session_id)
+
+    async def persist_session(self, session_id: str) -> None:
+        """Persist lightweight session metadata through the configured store."""
+        await self._persist_session(session_id)
+
+    def _schedule_persist(self, session_id: str) -> None:
+        try:
+            asyncio.get_running_loop().create_task(self._persist_session(session_id))
+        except RuntimeError:
+            logger.debug("No running loop; skipped async persist scheduling for %s", session_id)
+
+    async def start_interview_graph(
+        self,
+        session_id: str,
+        *,
+        stream_sink: StreamSink | None = None,
+    ) -> dict:
+        """Kick off the graph.
+
+        Practice:     analyze_jd -> plan_questions -> ask_question -> interrupt
+        Professional: analyze_resume -> analyze_jd -> plan_round1 -> ask_question -> interrupt
+        """
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+
+        started_at = time.perf_counter()
+        async with data.lock:
+            if data.graph_started:
+                state = await self.get_graph_state(session_id) or data.last_state
+                self._sync_session_from_state(session_id, state)
+                await self._cache_runtime_state(session_id, state)
+                return state
+
+            session = data.session
+            mode = data.mode
+            graph = self._get_graph(mode)
+            memory = get_memory_service()
+            semantic_query = self._build_memory_query(session.jd_text, data.resume_text)
+            memory_started_at = time.perf_counter()
+            memory_context = await memory.abuild_context(
+                data.user_id,
+                semantic_query=semantic_query,
+            )
+            logger.info(
+                "Interview preparation memory context ready: session=%s elapsed=%.2fs items=%d",
+                session_id,
+                time.perf_counter() - memory_started_at,
+                sum(
+                    len(items)
+                    for items in (
+                        memory_context.profile_items,
+                        memory_context.resume_items,
+                        memory_context.recent_reflections,
+                        memory_context.weak_skills,
+                        memory_context.relevant_episodes,
+                        memory_context.semantic_memories,
+                    )
+                ),
+            )
+            memory_context_text = memory.format_context(memory_context)
+
+            initial_state: InterviewState = {
+                "interview_mode": mode,
+                "user_id": data.user_id,
+                "jd_text": session.jd_text,
+                "memory_context": memory_context_text,
+                "retrieved_memories": memory_context.model_dump(mode="json"),
+                "max_follow_ups": session.max_follow_ups,
+                "current_question_index": 0,
+                "follow_up_count": 0,
+                "conversation_history": [],
+                "assessments": [],
+                "interview_complete": False,
+                "current_round": 1,
+            }
+
+            if mode == "professional" and data.resume_text:
+                initial_state["resume_text"] = data.resume_text
+            if mode == "professional" and data.resume_parse_result:
+                initial_state["resume_parse_result"] = data.resume_parse_result
+
+            self.update_session_status(session_id, "analyzing")
+            stream_token = set_stream_sink(stream_sink)
+            try:
+                graph_started_at = time.perf_counter()
+                result = await graph.ainvoke(initial_state, self._config(session_id))
+                logger.info(
+                    "Interview preparation graph ready: session=%s mode=%s elapsed=%.2fs total=%.2fs questions=%d",
+                    session_id,
+                    mode,
+                    time.perf_counter() - graph_started_at,
+                    time.perf_counter() - started_at,
+                    len(result.get("question_plan", []) or []),
+                )
+                data.graph_started = True
+                if result.get("resume_profile"):
+                    try:
+                        saved = await memory.asave_resume_profile(
+                            data.user_id,
+                            session_id,
+                            result.get("resume_profile"),
+                        )
+                        await memory.aindex_memory_items(saved)
+                    except Exception:
+                        logger.exception("Failed to save resume memory for session=%s", session_id)
+                self._sync_session_from_state(session_id, result)
+                if not result.get("interview_complete"):
+                    self.update_session_status(session_id, "interviewing")
+                await self._cache_runtime_state(session_id, result)
+                return result
+            except Exception as exc:
+                data.error_message = str(exc)
+                self.update_session_status(session_id, "failed")
+                raise
+            finally:
+                reset_stream_sink(stream_token)
+
+    async def submit_answer(
+        self,
+        session_id: str,
+        answer: str,
+        *,
+        stream_sink: StreamSink | None = None,
+    ) -> dict:
+        """Inject candidate answer and resume the graph."""
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+
+        async with session_answer_lock(session_id):
+            async with data.lock:
+                if not data.graph_started:
+                    raise RuntimeError("Interview graph has not started")
+
+                mode = data.mode
+                graph = self._get_graph(mode)
+                config = self._config(session_id)
+
+                self.update_session_status(session_id, "evaluating")
+                stream_token = set_stream_sink(stream_sink)
+                try:
+                    if hasattr(graph, "aupdate_state"):
+                        await graph.aupdate_state(config, {"current_candidate_answer": answer})
+                    else:
+                        graph.update_state(config, {"current_candidate_answer": answer})
+                    result = await graph.ainvoke(None, config)
+                    await self._persist_new_assessment_memories(session_id, result, answer)
+
+                    if result.get("interview_complete"):
+                        if mode == "practice":
+                            practice_report = result.get("practice_report")
+                            if practice_report:
+                                self.save_practice_report(session_id, practice_report)
+                        else:
+                            pro_report = result.get("professional_report")
+                            if pro_report:
+                                self.save_professional_report(session_id, pro_report)
+                            else:
+                                report = result.get("final_report")
+                                if report:
+                                    self.save_report(session_id, report)
+                        await self._persist_final_memory(session_id, result)
+
+                    self._sync_session_from_state(session_id, result)
+                    if not result.get("interview_complete"):
+                        self.update_session_status(session_id, "interviewing")
+                    await self._cache_runtime_state(session_id, result)
+                    return result
+                except Exception as exc:
+                    data.error_message = str(exc)
+                    self.update_session_status(session_id, "failed")
+                    raise
+                finally:
+                    reset_stream_sink(stream_token)
+
+    async def stop_interview(self, session_id: str) -> dict:
+        """Stop the interview early and generate a report with whatever has been answered.
+
+        Works by directly calling the appropriate evaluator with the current state.
+        """
+        data = self._sessions.get(session_id)
+        if not data:
+            raise ValueError(f"Session {session_id} not found")
+
+        async with data.lock:
+            mode = data.mode
+            graph = self._get_graph(mode)
+            config = self._config(session_id)
+
+            try:
+                if hasattr(graph, "aget_state"):
+                    snapshot = await graph.aget_state(config)
+                else:
+                    snapshot = graph.get_state(config)
+                current_state = snapshot.values if snapshot else data.last_state
+            except Exception:
+                current_state = data.last_state
+
+            current_state = dict(current_state or {})
+            if not current_state or not current_state.get("assessments"):
+                has_r1 = bool(current_state.get("round1_assessments"))
+                if not has_r1:
+                    result = {
+                        "interview_complete": True,
+                        "practice_report": None,
+                        "professional_report": None,
+                        "final_report": None,
+                    }
+                    self.update_session_status(session_id, "completed")
+                    self._sync_session_from_state(session_id, result)
+                    await self._cache_runtime_state(session_id, result)
+                    return result
+
+            logger.info(
+                "Stopping interview early: %s (mode=%s, round=%d, %d assessments so far)",
+                session_id,
+                mode,
+                current_state.get("current_round", 1),
+                len(current_state.get("assessments", [])),
+            )
+
+            self.update_session_status(session_id, "evaluating")
+            try:
+                if mode == "practice":
+                    result = await evaluate_practice(current_state)
+                    practice_report = result.get("practice_report")
+                    if practice_report:
+                        self.save_practice_report(session_id, practice_report)
+                else:
+                    result = await evaluate_interview(current_state)
+                    pro_report = result.get("professional_report")
+                    if pro_report:
+                        self.save_professional_report(session_id, pro_report)
+                    else:
+                        report = result.get("final_report")
+                        if report:
+                            self.save_report(session_id, report)
+
+                result["interview_complete"] = True
+                merged_state = dict(current_state)
+                merged_state.update(result)
+                await self._persist_new_assessment_memories(session_id, merged_state, "")
+                await self._persist_final_memory(session_id, merged_state)
+                self._sync_session_from_state(session_id, merged_state)
+                self.update_session_status(session_id, "completed")
+                await self._cache_runtime_state(session_id, merged_state)
+                return merged_state
+            except Exception as exc:
+                data.error_message = str(exc)
+                self.update_session_status(session_id, "failed")
+                raise
+
+    async def get_graph_state(self, session_id: str) -> dict | None:
+        mode = self.get_session_mode(session_id)
+        graph = self._get_graph(mode)
+        try:
+            if hasattr(graph, "aget_state"):
+                snapshot = await graph.aget_state(self._config(session_id))
+            else:
+                snapshot = graph.get_state(self._config(session_id))
+            return snapshot.values if snapshot else None
+        except Exception:
+            return None
+
+    # Long-term memory helpers
+
+    def _build_memory_query(self, jd_text: str, resume_text: str = "") -> str:
+        parts = [
+            "Interview personalization query.",
+            "Job description:",
+            jd_text[:1200],
+        ]
+        if resume_text:
+            parts.extend(["Candidate resume:", resume_text[:1000]])
+        return "\n".join(parts)
+
+    def _candidate_question(self, state: dict, question_id: int) -> QuestionItem | None:
+        plans = [
+            state.get("question_plan", []),
+            state.get("round1_question_plan", []),
+            state.get("round2_question_plan", []),
+        ]
+        for plan in plans:
+            for raw_question in plan or []:
+                question = (
+                    raw_question
+                    if isinstance(raw_question, QuestionItem)
+                    else QuestionItem.model_validate(raw_question)
+                )
+                if question.id == question_id:
+                    return question
+        return None
+
+    async def _persist_new_assessment_memories(
+        self,
+        session_id: str,
+        state: dict,
+        latest_answer: str,
+    ) -> None:
+        data = self._sessions.get(session_id)
+        if not data:
+            return
+
+        assessments = state.get("assessments", []) or []
+        if data.persisted_assessment_count >= len(assessments):
+            return
+
+        memory = get_memory_service()
+        mode = data.mode
+        for raw_assessment in assessments[data.persisted_assessment_count:]:
+            try:
+                assessment = raw_assessment
+                if not hasattr(assessment, "question_id"):
+                    from app.models.interview import AnswerAssessment
+
+                    assessment = AnswerAssessment.model_validate(raw_assessment)
+
+                question = self._candidate_question(state, assessment.question_id)
+                item = await memory.asave_assessment_episode(
+                    user_id=data.user_id,
+                    session_id=session_id,
+                    assessment=assessment,
+                    question=question,
+                    answer=latest_answer,
+                    mode=mode,
+                )
+                await memory.aindex_memory_item(item)
+                data.persisted_assessment_count += 1
+            except Exception:
+                logger.exception(
+                    "Failed to persist assessment memory: session=%s index=%d",
+                    session_id,
+                    data.persisted_assessment_count,
+                )
+
+    async def _persist_final_memory(self, session_id: str, state: dict) -> None:
+        data = self._sessions.get(session_id)
+        if not data or data.final_memory_saved:
+            return
+
+        report = (
+            state.get("practice_report")
+            or state.get("professional_report")
+            or state.get("final_report")
+        )
+        try:
+            memory = get_memory_service()
+            item = await memory.asave_session_reflection(
+                user_id=data.user_id,
+                session_id=session_id,
+                mode=data.mode,
+                report=report,
+                assessments=state.get("assessments", []) or [],
+            )
+            if item:
+                await memory.aindex_memory_item(item)
+            data.final_memory_saved = True
+        except Exception:
+            logger.exception("Failed to persist final memory: session=%s", session_id)
+
+
+# Module-level singleton
+_manager: SessionManager | None = None
+
+
+def get_session_manager() -> SessionManager:
+    global _manager
+    if _manager is None:
+        _manager = SessionManager()
+    return _manager
+
+
+def reset_session_manager() -> None:
+    """Reset the singleton manager so a newly initialized checkpointer is used."""
+    global _manager
+    _manager = None
