@@ -111,7 +111,12 @@ def diversify_results(
     return selected
 
 
-def hydrate_parent_results(results: list[Any], top_k: int) -> list[Any]:
+def hydrate_parent_results(
+    results: list[Any],
+    top_k: int,
+    *,
+    strategy: str = "legacy",
+) -> list[Any]:
     """Aggregate retrieved child chunks back to parent question references."""
     groups: dict[str, dict[str, Any]] = {}
 
@@ -125,6 +130,7 @@ def hydrate_parent_results(results: list[Any], top_k: int) -> list[Any]:
             {
                 "best": result,
                 "score": 0.0,
+                "scores": [],
                 "chunk_ids": [],
                 "chunk_types": [],
                 "chunk_texts": [],
@@ -132,6 +138,7 @@ def hydrate_parent_results(results: list[Any], top_k: int) -> list[Any]:
             },
         )
         group["score"] += float(getattr(result, "score", 0.0))
+        group["scores"].append(float(getattr(result, "score", 0.0)))
         if float(getattr(result, "score", 0.0)) > float(getattr(group["best"], "score", 0.0)):
             group["best"] = result
 
@@ -152,7 +159,14 @@ def hydrate_parent_results(results: list[Any], top_k: int) -> list[Any]:
     for parent_id, group in groups.items():
         best = copy(group["best"])
         best.id = parent_id
-        best.score = group["score"]
+        if strategy == "bounded":
+            best_score = max(group["scores"], default=0.0)
+            # A second matching chunk type is useful corroboration, but a parent
+            # must never win merely because it owns many answer/follow-up chunks.
+            diversity_steps = min(max(len(group["chunk_types"]) - 1, 0), 2)
+            best.score = best_score * (1.0 + 0.05 * diversity_steps)
+        else:
+            best.score = group["score"]
         best.source = "+".join(sorted(group["sources"])) or getattr(best, "source", "")
 
         metadata = dict(getattr(best, "metadata", {}))

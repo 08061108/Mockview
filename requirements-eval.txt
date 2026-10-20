@@ -1,0 +1,5 @@
+# Optional legacy RAGAS tooling; not installed by Docker or required by the app.
+-r requirements.txt
+ragas>=0.2.0
+datasets>=2.18.0
+matplotlib==3.11.2

@@ -1,0 +1,9 @@
+{
+  "id": "synthetic-query-rewrite",
+  "content": "合成查询改写练习：将缩写扩展并补充领域专业术语，把单一查询拆分为多个子查询并行检索，对多路改写结果进行融合与去重。",
+  "skill_tags": ["查询改写"],
+  "difficulty": "medium",
+  "reference_points": ["保持原查询意图", "为不同子查询保留来源标识", "检查检索结果是否相关"],
+  "follow_up_directions": ["说明改写失败时如何回到原查询"],
+  "provenance": "Synthetic boundary fixture authored for these tests; not extracted from private evaluation output or historical corpus."
+}

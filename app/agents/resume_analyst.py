@@ -73,6 +73,7 @@ async def analyze_resume(state: InterviewState) -> dict:
         ],
         response_model=ResumeProfile,
         temperature=0.2,
+        strategy="simple",
     )
 
     if isinstance(parse_result, ResumeParseResult):

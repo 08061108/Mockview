@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 from pathlib import Path
 
 from app.models.resume import ResumeParseMetadata, ResumeParseResult
 from app.resume.links import extract_resume_links
 from app.resume.normalizer import normalize_resume_text
+from app.errors import document_error
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,10 @@ VISION_OCR_PROMPT = (
 
 async def parse_pdf(file_path: str | Path) -> tuple[str, ResumeParseMetadata]:
     """Extract text from a PDF resume using pdfplumber."""
+    return await asyncio.to_thread(_parse_pdf_sync, file_path)
+
+
+def _parse_pdf_sync(file_path: str | Path) -> tuple[str, ResumeParseMetadata]:
     import pdfplumber
 
     file_path = Path(file_path)
@@ -61,7 +67,7 @@ async def parse_image_with_vision(file_path: str | Path) -> tuple[str, ResumePar
 
     raw_text = await llm.chat_vision(image_path=file_path, prompt=VISION_OCR_PROMPT)
     if not raw_text.strip():
-        raise ValueError("Vision model could not extract text from the resume image.")
+        raise document_error("EMPTY_DOCUMENT", "图片中未识别到可用的简历文本。", 422)
 
     metadata = ResumeParseMetadata(
         file_name=file_path.name,
@@ -83,15 +89,22 @@ async def parse_resume_document(file_path: str | Path) -> ResumeParseResult:
         try:
             raw_text, metadata = await parse_pdf(file_path)
         except ValueError as exc:
-            warnings.append(str(exc))
-            warnings.append("Falling back to vision OCR for the PDF file.")
-            raw_text, metadata = await parse_image_with_vision(file_path)
-            metadata.parser = "vision_ocr_fallback"
+            raise document_error(
+                "EMPTY_DOCUMENT",
+                "该 PDF 没有可提取文本，可能是扫描件；请改为上传 PNG 或 JPG 图片。",
+                422,
+            ) from exc
+        except Exception as exc:
+            raise document_error(
+                "INVALID_DOCUMENT", "PDF 文件损坏或无法解析，请检查文件后重试。", 422
+            ) from exc
     elif suffix in (".png", ".jpg", ".jpeg"):
         raw_text, metadata = await parse_image_with_vision(file_path)
     else:
-        raise ValueError(
-            f"Unsupported file format: {suffix}. Please upload a PDF, PNG, JPG, or JPEG file."
+        raise document_error(
+            "UNSUPPORTED_FILE_TYPE",
+            "不支持该文件类型，请上传 PDF、PNG、JPG 或 JPEG。",
+            415,
         )
 
     normalized_text, normalize_warnings = normalize_resume_text(raw_text)

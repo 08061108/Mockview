@@ -1,7 +1,17 @@
-node_modules/
-dist/
-.env
-.env.*
-!.env.example
-npm-debug.log*
-*.tsbuildinfo
+# Explicit frontend build context.
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!index.html
+!nginx.conf
+!tsconfig.json
+!tsconfig.node.json
+!vite.config.ts
+!src/
+!src/**
+!public/
+!public/**
+**/.env
+**/.env.*
+**/*.log

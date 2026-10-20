@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
+from app.models.public import PublicInterviewReport, PublicTranscript
 
 
 # ── Client → Server messages ────────────────────────────────────────
@@ -12,9 +13,11 @@ from pydantic import BaseModel, Field
 class ClientMessage(BaseModel):
     """Envelope for all client-to-server WebSocket messages."""
 
-    type: Literal["start", "start_interview", "answer", "stop", "end_interview", "ping"]
+    type: Literal["start", "start_interview", "answer", "retry", "stop", "end_interview", "ping"]
     content: str = ""
     answer_id: str | None = None
+    turn_id: str | None = None
+    retry_id: str | None = None
 
 
 # ── Server → Client messages ────────────────────────────────────────
@@ -33,6 +36,8 @@ class ServerQuestion(BaseModel):
     content: str
     skill_tags: list[str] = Field(default_factory=list)
     difficulty: str = ""
+    question_id: str = ""
+    turn_id: str = ""
 
 
 class ServerFollowUp(BaseModel):
@@ -40,6 +45,8 @@ class ServerFollowUp(BaseModel):
     question_index: int
     follow_up_number: int
     content: str
+    question_id: str = ""
+    turn_id: str = ""
 
 
 class ServerQuestionStream(BaseModel):
@@ -58,16 +65,26 @@ class ServerQuestionStream(BaseModel):
     skill_tags: list[str] = Field(default_factory=list)
     difficulty: str = ""
     sequence: int | None = None
+    question_id: str = ""
+    turn_id: str = ""
 
 
 class ServerReport(BaseModel):
     type: Literal["report"] = "report"
-    data: dict[str, Any]
+    data: PublicInterviewReport
+
+
+class ServerTranscriptSnapshot(BaseModel):
+    type: Literal["transcript_snapshot"] = "transcript_snapshot"
+    data: PublicTranscript
 
 
 class ServerError(BaseModel):
     type: Literal["error"] = "error"
     message: str
+    code: str = "INTERNAL_ERROR"
+    retryable: bool = False
+    retry_after_seconds: int | None = None
 
 
 class ServerInterviewEnd(BaseModel):

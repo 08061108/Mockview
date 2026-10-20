@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from uuid import uuid4
 
 from app.memory.models import (
     MasteryLevel,
@@ -15,7 +16,7 @@ from app.memory.models import (
 )
 from app.memory.store import MemoryStore, get_memory_store
 from app.memory.vector_store import MemoryVectorStore, get_memory_vector_store
-from app.models.interview import AnswerAssessment
+from app.models.interview import AnswerAssessment, FinalQuestionAssessment
 from app.models.question import QuestionItem
 from app.models.report import InterviewReport, PracticeReport, ProfessionalReport
 from app.models.resume import ResumeProfile
@@ -52,6 +53,10 @@ def _priority(avg_score: float, recent_score: float, attempts: int) -> float:
     weakness = max(0.0, 10.0 - (recent_score * 0.65 + avg_score * 0.35)) / 10.0
     evidence_boost = min(attempts, 5) * 0.04
     return max(0.0, min(1.0, weakness + evidence_boost))
+
+
+def _is_valid(item: MemoryItem) -> bool:
+    return item.structured.get("validity", "valid") == "valid"
 
 
 class MemoryService:
@@ -100,11 +105,11 @@ class MemoryService:
             )
         return MemoryContext(
             user_id=user_id,
-            profile_items=profile_items,
-            resume_items=resume_items,
-            recent_reflections=recent_reflections,
+            profile_items=[item for item in profile_items if _is_valid(item)],
+            resume_items=[item for item in resume_items if _is_valid(item)],
+            recent_reflections=[item for item in recent_reflections if _is_valid(item)],
             weak_skills=weak_skills,
-            relevant_episodes=relevant_episodes,
+            relevant_episodes=[item for item in relevant_episodes if _is_valid(item)],
         )
 
     async def abuild_context(
@@ -150,7 +155,7 @@ class MemoryService:
         semantic_memories: list[MemoryItem] = []
         for result in results:
             item = await self._aget_memory_item(result["id"])
-            if not item or item.id in seen_ids:
+            if not item or item.id in seen_ids or not _is_valid(item):
                 continue
             semantic_memories.append(
                 item.model_copy(
@@ -208,12 +213,250 @@ class MemoryService:
             )
         return MemoryContext(
             user_id=user_id,
-            profile_items=profile_items,
-            resume_items=resume_items,
-            recent_reflections=recent_reflections,
+            profile_items=[item for item in profile_items if _is_valid(item)],
+            resume_items=[item for item in resume_items if _is_valid(item)],
+            recent_reflections=[item for item in recent_reflections if _is_valid(item)],
             weak_skills=weak_skills,
-            relevant_episodes=relevant_episodes,
+            relevant_episodes=[item for item in relevant_episodes if _is_valid(item)],
         )
+
+    def save_final_observation(
+        self,
+        user_id: str,
+        session_id: str,
+        final: FinalQuestionAssessment,
+        question: QuestionItem | None,
+        transcript: list[dict] | None = None,
+    ) -> MemoryItem:
+        skills = [final.primary_skill]
+        item = MemoryItem(
+            id=final.observation_id,
+            user_id=user_id,
+            memory_type=MemoryType.INTERVIEW_EPISODE,
+            content=(
+                f"Final observation for {final.primary_skill}: "
+                f"score={final.score if final.score is not None else 'unscored'}/10; "
+                f"covered={'; '.join(final.covered_points[:4]) or 'none'}; "
+                f"missed={'; '.join(final.missed_points[:4]) or 'none'}."
+            ),
+            structured={
+                "observation_id": final.observation_id,
+                "session_id": session_id,
+                "question_id": final.question_id,
+                "display_id": final.display_id,
+                "question": question.content if question else "",
+                "score": final.score,
+                "scorable": final.scorable,
+                "covered_points": final.covered_points,
+                "missed_points": final.missed_points,
+                "answer_evidence": final.answer_evidence,
+                "hint_dependency": final.hint_dependency,
+                "skill_tags": skills,
+                "primary_skill": final.primary_skill,
+                "validity": "valid",
+                "projection_status": "pending",
+                "transcript": transcript or [],
+            },
+            tags=["episode", "final_observation", *skills],
+            source="final_question_assessment",
+            source_id=session_id,
+            importance=0.8 if final.score is not None and final.score < 7 else 0.6,
+            confidence=0.9 if final.scorable else 0.5,
+        )
+        saved = self.store.upsert_memory_item(item)
+        self.recompute_skill_memory(user_id, final.primary_skill)
+        return saved
+
+    async def asave_final_observation(
+        self,
+        user_id: str,
+        session_id: str,
+        final: FinalQuestionAssessment,
+        question: QuestionItem | None,
+        transcript: list[dict] | None = None,
+    ) -> MemoryItem:
+        item = MemoryItem(
+            id=final.observation_id,
+            user_id=user_id,
+            memory_type=MemoryType.INTERVIEW_EPISODE,
+            content=(
+                f"Final observation for {final.primary_skill}: "
+                f"score={final.score if final.score is not None else 'unscored'}/10; "
+                f"covered={'; '.join(final.covered_points[:4]) or 'none'}; "
+                f"missed={'; '.join(final.missed_points[:4]) or 'none'}."
+            ),
+            structured={
+                "observation_id": final.observation_id,
+                "session_id": session_id,
+                "question_id": final.question_id,
+                "display_id": final.display_id,
+                "question": question.content if question else "",
+                "score": final.score,
+                "scorable": final.scorable,
+                "covered_points": final.covered_points,
+                "missed_points": final.missed_points,
+                "answer_evidence": final.answer_evidence,
+                "hint_dependency": final.hint_dependency,
+                "skill_tags": [final.primary_skill],
+                "primary_skill": final.primary_skill,
+                "validity": "valid",
+                "projection_status": "pending",
+                "transcript": transcript or [],
+            },
+            tags=["episode", "final_observation", final.primary_skill],
+            source="final_question_assessment",
+            source_id=session_id,
+            importance=0.8 if final.score is not None and final.score < 7 else 0.6,
+            confidence=0.9 if final.scorable else 0.5,
+        )
+        if hasattr(self.store, "aupsert_memory_item"):
+            saved = await self.store.aupsert_memory_item(item)
+        else:
+            saved = self.store.upsert_memory_item(item)
+        await self.arecompute_skill_memory(user_id, final.primary_skill)
+        return saved
+
+    def recompute_skill_memory(self, user_id: str, skill_name: str) -> SkillMemory:
+        observations = self.store.list_memory_items(
+            user_id, memory_types=[MemoryType.INTERVIEW_EPISODE.value], limit=1000
+        )
+        valid = [
+            item for item in observations
+            if _is_valid(item)
+            and item.structured.get("primary_skill") == skill_name
+            and item.structured.get("scorable", True)
+            and item.structured.get("score") is not None
+        ]
+        scores = [float(item.structured["score"]) for item in valid]
+        recent = scores[0] if scores else 0.0
+        average = sum(scores) / len(scores) if scores else 0.0
+        covered = [point for item in valid for point in item.structured.get("covered_points", [])]
+        missed = [point for item in valid for point in item.structured.get("missed_points", [])]
+        existing = self.store.get_skill_memory(user_id, skill_name)
+        memory = SkillMemory(
+            id=(existing.id if existing else _stable_id(user_id, "skill", skill_name)),
+            user_id=user_id,
+            skill_name=skill_name,
+            category=(existing.category if existing else "unknown"),
+            attempts=len(valid),
+            avg_score=round(average, 2),
+            recent_score=recent,
+            mastery_level=_mastery(recent) if scores else MasteryLevel.UNKNOWN.value,
+            strengths=_dedupe_append([], covered),
+            weak_points=_dedupe_append([], missed),
+            evidence_memory_ids=[item.id for item in valid],
+            next_practice_priority=round(_priority(average, recent, len(valid)), 3) if scores else 0.5,
+            created_at=(existing.created_at if existing else utc_now()),
+            updated_at=utc_now(),
+        )
+        return self.store.upsert_skill_memory(memory)
+
+    async def arecompute_skill_memory(self, user_id: str, skill_name: str) -> SkillMemory:
+        if not hasattr(self.store, "alist_memory_items"):
+            return self.recompute_skill_memory(user_id, skill_name)
+        observations = await self.store.alist_memory_items(
+            user_id, memory_types=[MemoryType.INTERVIEW_EPISODE.value], limit=1000
+        )
+        valid = [
+            item for item in observations
+            if _is_valid(item)
+            and item.structured.get("primary_skill") == skill_name
+            and item.structured.get("scorable", True)
+            and item.structured.get("score") is not None
+        ]
+        scores = [float(item.structured["score"]) for item in valid]
+        recent = scores[0] if scores else 0.0
+        average = sum(scores) / len(scores) if scores else 0.0
+        existing = await self.store.aget_skill_memory(user_id, skill_name)
+        memory = SkillMemory(
+            id=(existing.id if existing else _stable_id(user_id, "skill", skill_name)),
+            user_id=user_id,
+            skill_name=skill_name,
+            category=(existing.category if existing else "unknown"),
+            attempts=len(valid),
+            avg_score=round(average, 2),
+            recent_score=recent,
+            mastery_level=_mastery(recent) if scores else MasteryLevel.UNKNOWN.value,
+            strengths=_dedupe_append([], [point for item in valid for point in item.structured.get("covered_points", [])]),
+            weak_points=_dedupe_append([], [point for item in valid for point in item.structured.get("missed_points", [])]),
+            evidence_memory_ids=[item.id for item in valid],
+            next_practice_priority=round(_priority(average, recent, len(valid)), 3) if scores else 0.5,
+            created_at=(existing.created_at if existing else utc_now()),
+            updated_at=utc_now(),
+        )
+        return await self.store.aupsert_skill_memory(memory)
+
+    async def dispute_observation(self, user_id: str, observation_id: str) -> MemoryItem:
+        item = await self._aget_memory_item(observation_id)
+        if not item or item.user_id != user_id:
+            raise KeyError(observation_id)
+        updated = item.model_copy(
+            update={
+                "structured": {**item.structured, "validity": "disputed"},
+                "updated_at": utc_now(),
+            }
+        )
+        if hasattr(self.store, "aupsert_memory_item"):
+            updated = await self.store.aupsert_memory_item(updated)
+        else:
+            updated = self.store.upsert_memory_item(updated)
+        skill = str(updated.structured.get("primary_skill") or "")
+        if skill:
+            await self.arecompute_skill_memory(user_id, skill)
+        return updated
+
+    async def correct_fact(
+        self,
+        user_id: str,
+        content: str,
+        replaces_memory_id: str | None = None,
+    ) -> MemoryItem:
+        replacement_id = f"fact:{user_id}:{uuid4().hex}"
+        replaced_skill = ""
+        if replaces_memory_id:
+            prior = await self._aget_memory_item(replaces_memory_id)
+            if not prior or prior.user_id != user_id:
+                raise KeyError(replaces_memory_id)
+            replaced = prior.model_copy(
+                update={
+                    "structured": {
+                        **prior.structured,
+                        "validity": "replaced",
+                        "replaced_by": replacement_id,
+                    },
+                    "updated_at": utc_now(),
+                }
+            )
+            if hasattr(self.store, "aupsert_memory_item"):
+                await self.store.aupsert_memory_item(replaced)
+            else:
+                self.store.upsert_memory_item(replaced)
+            replaced_skill = str(prior.structured.get("primary_skill") or "")
+        item = MemoryItem(
+            id=replacement_id,
+            user_id=user_id,
+            memory_type=MemoryType.PROFILE,
+            content=content,
+            structured={
+                "validity": "valid",
+                "projection_status": "pending",
+                "replaces_memory_id": replaces_memory_id,
+                "user_confirmed": True,
+            },
+            tags=["profile", "user_correction"],
+            source="user_correction",
+            source_id=replaces_memory_id,
+            confidence=1.0,
+            importance=0.9,
+        )
+        if hasattr(self.store, "aupsert_memory_item"):
+            saved = await self.store.aupsert_memory_item(item)
+        else:
+            saved = self.store.upsert_memory_item(item)
+        if replaced_skill:
+            await self.arecompute_skill_memory(user_id, replaced_skill)
+        await self.aindex_memory_item(saved)
+        return saved
 
     async def _aget_memory_item(self, memory_id: str) -> MemoryItem | None:
         if hasattr(self.store, "aget_memory_item"):
@@ -355,13 +598,29 @@ class MemoryService:
             )
         return items
 
-    async def aindex_memory_item(self, item: MemoryItem) -> None:
+    async def aindex_memory_item(self, item: MemoryItem) -> bool:
         """Index one MemoryItem for semantic recall. Failures should not block interviews."""
         try:
             vector_store = self.vector_store or get_memory_vector_store()
             await vector_store.upsert_item(item)
+            if item.structured.get("projection_status") == "pending":
+                completed = item.model_copy(
+                    update={
+                        "structured": {
+                            **item.structured,
+                            "projection_status": "completed",
+                        },
+                        "updated_at": utc_now(),
+                    }
+                )
+                if hasattr(self.store, "aupsert_memory_item"):
+                    await self.store.aupsert_memory_item(completed)
+                else:
+                    self.store.upsert_memory_item(completed)
+            return True
         except Exception:
             logger.exception("Failed to index memory item: id=%s", item.id)
+            return False
 
     async def aindex_memory_items(self, items: list[MemoryItem]) -> None:
         for item in items:

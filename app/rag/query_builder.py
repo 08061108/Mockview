@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from app.domain.skill_aliases import retrieval_aliases
 from app.models.jd import SkillItem, SkillMatrix
+from app.models.preparation import AssessmentTarget
 from app.models.resume import ResumeJDMatch, ResumeProfile
 
 if TYPE_CHECKING:
@@ -13,6 +15,7 @@ if TYPE_CHECKING:
 
 
 RetrievalPurpose = Literal["practice", "round1", "round2"]
+QueryStrategy = Literal["legacy", "target_expansion_v1", "target_expansion_v2"]
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,9 @@ def build_retrieval_queries(
     state: InterviewState,
     purpose: RetrievalPurpose,
     max_queries: int = 5,
+    *,
+    strategy: QueryStrategy = "legacy",
+    max_expansion_queries: int = 3,
 ) -> list[RetrievalQuery]:
     """Build a compact set of retrieval queries from interview state.
 
@@ -105,6 +111,117 @@ def build_retrieval_queries(
             )
         )
 
+    base_queries = _dedupe_queries(queries, max_queries=max_queries)
+    if strategy == "legacy":
+        return base_queries
+    if strategy not in {"target_expansion_v1", "target_expansion_v2"}:
+        raise ValueError(f"unsupported RAG query strategy: {strategy}")
+    return _dedupe_queries(
+        [
+            *base_queries,
+            *build_target_expansion_queries(
+                state,
+                strategy=strategy,
+                max_queries=max_expansion_queries,
+            ),
+        ],
+        max_queries=max_queries + max_expansion_queries,
+    )
+
+
+def build_target_expansion_queries(
+    state: InterviewState,
+    *,
+    strategy: Literal[
+        "target_expansion_v1", "target_expansion_v2"
+    ] = "target_expansion_v1",
+    max_queries: int = 3,
+) -> list[RetrievalQuery]:
+    """Build stable production candidate queries from frozen assessment targets."""
+
+    if max_queries <= 0:
+        return []
+    targets = [
+        item if isinstance(item, AssessmentTarget) else AssessmentTarget.model_validate(item)
+        for item in (state.get("assessment_targets", []) or [])
+    ]
+    targets.sort(key=lambda item: (-item.importance, item.target_id))
+    expanded: list[RetrievalQuery] = []
+    for target in targets:
+        if strategy == "target_expansion_v1":
+            text = f"{target.scope} {target.verification_goal}"
+            purpose = "assessment_target"
+        else:
+            aliases = retrieval_aliases([target.scope, target.skill_id], limit=8)
+            text = " ".join(
+                [
+                    target.scope,
+                    *aliases,
+                    "原理 场景 工程边界 implementation pitfalls interview",
+                ]
+            )
+            purpose = "assessment_target_aliases"
+        expanded.append(
+            RetrievalQuery(text, purpose, max(0.6, target.importance))
+        )
+    if not expanded:
+        expanded = [
+            RetrievalQuery(
+                f"{skill.name} 原理 项目实践 工程边界 面试题",
+                "target_skill_expansion",
+                max(0.6, skill.weight),
+            )
+            for skill in _top_skills(state["skill_matrix"], limit=max_queries)
+        ]
+    return _dedupe_queries(expanded, max_queries=max_queries)
+
+
+def build_target_recovery_queries(
+    target: AssessmentTarget,
+    requested_query: str,
+    *,
+    max_queries: int = 3,
+) -> list[RetrievalQuery]:
+    """Build bounded corrective queries without mixing broad and narrow aliases."""
+
+    if max_queries <= 0:
+        return []
+    internal_markers = {
+        "technical_knowledge",
+        "personal_experience",
+        "evidence_missing",
+        "evidence_partial",
+    }
+    requested = " ".join(
+        token
+        for token in str(requested_query).split()
+        if token.casefold() not in internal_markers
+    )
+    queries = [RetrievalQuery(requested, "agent_requested", 1.0)]
+    queries.append(
+        RetrievalQuery(
+            f"{target.scope} {target.verification_goal}",
+            "target_verification",
+            1.0,
+        )
+    )
+    # The scope can also match a broad family such as RAG.  Expanding only the
+    # frozen skill identifier keeps the corrective alias query specific.
+    aliases = retrieval_aliases([target.skill_id], limit=6)
+    alias_text = " ".join(
+        item
+        for item in aliases
+        if item.casefold() != target.skill_id.casefold()
+    )
+    if alias_text:
+        broad_prefix = target.scope.split()[0] if target.scope.split() else ""
+        queries.append(
+            RetrievalQuery(
+                f"{broad_prefix} {alias_text}".strip(),
+                "target_skill_aliases",
+                0.95,
+            )
+        )
     return _dedupe_queries(queries, max_queries=max_queries)
 
 
@@ -215,6 +332,8 @@ def _dedupe_queries(
     queries: list[RetrievalQuery],
     max_queries: int,
 ) -> list[RetrievalQuery]:
+    if max_queries <= 0:
+        return []
     seen: set[str] = set()
     unique: list[RetrievalQuery] = []
     for query in queries:

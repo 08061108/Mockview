@@ -25,15 +25,13 @@ def memory_vector_enabled() -> bool:
 
 
 def postgres_enabled() -> bool:
-    return session_store_enabled() or memory_store_enabled() or memory_vector_enabled()
+    # Accounts always use PostgreSQL, independently of optional session/memory stores.
+    return True
 
 
 async def init_database() -> Any | None:
     """Initialize PostgreSQL pool and durable application tables when enabled."""
     global _pool
-    if not postgres_enabled():
-        logger.info("Application database initialized: memory/sqlite/chroma")
-        return None
     if _pool is not None:
         return _pool
 
@@ -42,7 +40,7 @@ async def init_database() -> Any | None:
         from psycopg_pool import AsyncConnectionPool
     except ImportError as exc:
         raise RuntimeError(
-            "SESSION_STORE_BACKEND=postgres requires psycopg[binary,pool]."
+            "The account database requires psycopg[binary,pool]."
         ) from exc
 
     _pool = AsyncConnectionPool(
@@ -53,6 +51,7 @@ async def init_database() -> Any | None:
         open=False,
     )
     await _pool.open()
+    await _pool.wait()
     await setup_database()
     logger.info("Application database initialized: postgres")
     return _pool
@@ -219,6 +218,7 @@ async def setup_database() -> None:
                 )
                 """
             )
+
             await conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_user_type
@@ -231,6 +231,10 @@ async def setup_database() -> None:
                 ON memory_embeddings (user_id, updated_at DESC)
                 """
             )
+
+        from app.services.migrations import run_migrations
+
+        await run_migrations(conn)
 
 
 async def close_database() -> None:

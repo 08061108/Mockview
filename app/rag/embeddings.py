@@ -7,6 +7,7 @@ import logging
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.llm.transport import build_model_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,9 @@ class EmbeddingService:
             self._client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
+                timeout=settings.model_timeout_seconds,
+                max_retries=settings.llm_transport_retries,
+                http_client=build_model_http_client(),
             )
         return self._client
 

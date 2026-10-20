@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Any
 
 from app.models.resume import ResumeJDMatch
@@ -15,6 +16,9 @@ def rerank_results(
     state: InterviewState,
     results: list[Any],
     purpose: str,
+    *,
+    strategy: str = "legacy",
+    retrieval_weight: float = 0.85,
 ) -> list[Any]:
     """Apply simple business-aware reranking on top of retrieval scores.
 
@@ -41,6 +45,7 @@ def rerank_results(
         missing_resume_skills = {_norm(skill) for skill in match.missing_skills}
 
     reranked = []
+    max_score = max(float(getattr(item, "score", 0.0)) for item in results) or 1.0
     for rank, result in enumerate(results, 1):
         metadata = getattr(result, "metadata", {})
         tags = {_norm(tag) for tag in metadata_list(metadata, "skill_tags")}
@@ -74,8 +79,18 @@ def rerank_results(
 
         # Slightly favor earlier retrieval ranks while preserving the original score scale.
         rank_bonus = 0.02 / max(rank, 1)
-        result.score = result.score + bonus + rank_bonus
-        reranked.append(result)
+        candidate = copy(result)
+        if strategy == "normalized":
+            # Context may reorder close candidates, but cannot swamp retrieval
+            # scores whose RRF scale is much smaller than the legacy bonuses.
+            context_score = min(1.0, bonus / 0.47)
+            candidate.score = (
+                retrieval_weight * (float(result.score) / max_score)
+                + (1.0 - retrieval_weight) * context_score
+            )
+        else:
+            candidate.score = result.score + bonus + rank_bonus
+        reranked.append(candidate)
 
     return sorted(reranked, key=lambda item: item.score, reverse=True)
 

@@ -1,324 +1,86 @@
-# Deployment Guide
+# 部署与本地开发
 
-This project now has four deployable parts:
+官方推荐根目录 `docker-compose.yml` 的 PostgreSQL、Redis、API、Web 四服务。完整应用保持**单 API 进程、单 worker**。账户始终需要 PostgreSQL，准备任务 admission 依赖 Redis；不能把 Redis 当成完整应用的可选增强。
 
-- `postgres`: PostgreSQL 16 with the pgvector extension for LangGraph checkpoints,
-  business session metadata, and durable long-term memory.
-- `api`: FastAPI backend with REST, WebSocket, LangGraph, RAG, ChromaDB question
-  index, and PostgreSQL-backed memory.
-- `web`: React/Vite browser client, built into static files and served by Nginx.
-- `redis`: Optional runtime enhancement layer for rate limiting, answer locks,
-  WebSocket presence, and lightweight session/report cache.
+## 版本与依赖
 
-The old Gradio UI can remain as an internal demo/debug tool, but it is not the recommended public frontend.
+| 组件 | 入口 |
+| --- | --- |
+| Python | 3.11，与 Dockerfile 一致 |
+| 默认运行依赖 | `requirements.txt` 引用 `requirements.lock` 的精确直接依赖 |
+| 测试 | `requirements-dev.txt` |
+| 可选历史 RAGAS | `requirements-eval.txt`，不进入默认镜像 |
+| 历史 Gradio | `requirements-legacy.txt`，不保证旧协议兼容 |
+| Node | 22.x，`npm ci` 使用 package-lock.json |
+| 数据库 | PostgreSQL 16 + pgvector；Redis 7 |
+| Compose | 2.24+，支持可选 env_file |
 
-## 1. Production Environment Variables
+pyproject 从同一 requirements.lock 读取运行依赖。该文件是**直接依赖锁**，不是完整传递依赖哈希锁；基础镜像、apt 与传递依赖仍会变化。实际干净构建结果见 [验证](docs/evaluation.md)。
 
-Backend `.env`:
+## 新目录启动
 
-```env
-LLM_API_KEY=your-llm-api-key
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL=qwen3.5-flash
-LLM_TEMPERATURE=0.7
+将 `.env.example` 复制为 `.env`。配置 Chat、Embedding 的 key/base/model，以及可选 Vision；服务须支持所用流式和结构化输出接口。实验自动循环还需 tool calling。示例中的具体模型名只是一份配置样例，不保证服务可用。
 
-VISION_API_KEY=
-VISION_BASE_URL=
-VISION_MODEL=qwen-vl-plus
+分别生成独立 `AUTH_SECRET_KEY` 和 URL-safe `POSTGRES_PASSWORD`：
 
-EMBEDDING_API_KEY=your-embedding-api-key
-EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_MODEL=text-embedding-v3
-
-CHROMA_PERSIST_DIR=./chroma_data
-POSTGRES_DB=mockview
-POSTGRES_USER=ai_mock
-POSTGRES_PASSWORD=replace-with-a-random-url-safe-password
-CHECKPOINTER_BACKEND=postgres
-POSTGRES_URL=postgresql://mockview:mockview@postgres:5432/mockview
-SESSION_STORE_BACKEND=postgres
-MEMORY_STORE_BACKEND=postgres
-MEMORY_VECTOR_BACKEND=pgvector
-UPLOAD_DIR=./uploads
-EXPORT_DIR=./exports
-
-HOST=0.0.0.0
-PORT=8000
-API_HOST_PORT=8000
-WEB_PORT=80
-DEBUG=false
-
-# Local development:
-CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://localhost
-
-# Production example:
-# CORS_ALLOWED_ORIGINS=https://interview.your-domain.com
-
-# Authentication. Change this before sharing a public URL.
-AUTH_SECRET_KEY=change-me-to-a-long-random-secret
-AUTH_TOKEN_EXPIRE_MINUTES=10080
-
-# Redis runtime enhancement layer. Keep false for plain local Python runs.
-# docker-compose enables Redis for the API container automatically.
-REDIS_ENABLED=false
-REDIS_URL=redis://localhost:6379/0
-RATE_LIMIT_START_PER_MINUTE=3
-RATE_LIMIT_ANSWER_PER_MINUTE=20
-RATE_LIMIT_RESUME_PER_HOUR=10
-REDIS_LOCK_TTL_MS=60000
-SESSION_CACHE_TTL_SECONDS=86400
-REPORT_CACHE_TTL_SECONDS=604800
-WS_PRESENCE_TTL_SECONDS=90
-
-# React/Vite build-time variables for the included web container.
-VITE_API_BASE_URL=/api
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Frontend `web/.env.local` for local development:
-
-```env
-VITE_API_BASE_URL=http://127.0.0.1:8000/api
-```
-
-Frontend production variables for a split deployment:
-
-```env
-VITE_API_BASE_URL=https://api.your-domain.com/api
-```
-
-Frontend production variables for the included Docker Compose deployment:
-
-```env
-VITE_API_BASE_URL=/api
-```
-
-With `VITE_API_BASE_URL=/api`, the Nginx web container serves React and proxies
-`/api`, `/api/ws`, and `/health` to the backend container.
-Users register or log in through the web UI. REST calls use `Authorization: Bearer <JWT>`, and WebSocket connections pass the same JWT in the `token` query parameter.
-
-## 2. Local Production-Like Run
-
-Build and start both backend and frontend:
+真实值只保存在本地。JWT 空值、弱值和常见占位符会阻止 API 启动；数据库密码不要使用模板值。前端 VITE 变量是公开构建时变量，不得放密钥。
 
 ```bash
 docker compose build
-docker compose up -d
+docker compose up -d postgres redis
+docker compose run --rm api python -m scripts.init_vector_store
+docker compose up -d api web
+docker compose ps
 ```
 
-Initialize the RAG vector store after API keys are configured:
+初始化读取 `data/question_bank/*.json` 和 `data/knowledge/*.json`，会调用 Embedding。拟公开包仅包含新写的 `mockview_demo.json`，历史开发目录中仍有未确认材料，不能直接打包。`--reset` 是破坏性重建选项，不用于正常启动。改变 Embedding 模型/维度后应使用独立新索引，不能混用向量。
+
+API 自动建立账户、业务、迁移和 checkpoint 表。`/health` 只是健康/能力状态检查，不代表真实模型请求和面试效果通过。默认 Web 为 localhost:80，宿主 API 仅绑定 127.0.0.1:8000；端口可由 `WEB_PORT`、`API_HOST_PORT` 修改。`VITE_API_BASE_URL=/api` 通过 Nginx 同源代理，前后端需一起更新。
+
+## 运行数据和镜像
+
+| 目录 | 用途 |
+| --- | --- |
+| postgres_data/ | 账户、准备任务、Session、checkpoint、长期记忆/pgvector |
+| redis_data/ | 限流、锁、在线状态与缓存持久化 |
+| chroma_data/ | 题库索引 |
+| data/question_bank/ | 只读题库输入 |
+| data/knowledge/ | 额外知识及可选发布快照，不默认公开 |
+| uploads/、exports/ | 用户上传与导出，不进入 Git 或镜像 |
+
+Dockerfile 只复制 app、两个运行脚本、依赖和合成示例；.dockerignore 采用允许清单。Compose 仅挂载题库、知识与各运行数据目录，不挂载整个 data。忽略规则不能过滤 bind mount，开发者显式挂载的内容仍会进入运行容器。
+
+已有数据不覆盖。更改 POSTGRES_PASSWORD 环境变量不会更改已初始化数据库密码，更改 Compose 项目名不会迁移 bind mount。备份需覆盖数据库、模型维度相容的索引和自有语料；不要通过删除数据或 `down -v` 排查配置问题。
+
+## 宿主开发
+
+Python 3.11 安装 `requirements-dev.txt`，Node 22 安装 Web。仍在独立目录运行 PostgreSQL/Redis：
 
 ```bash
-docker compose run --rm api python -m scripts.init_vector_store --reset
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d postgres redis
+python -m scripts.run_api
 ```
 
-Check the backend:
-
-```bash
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1/health
-```
-
-For frontend development without Docker:
+Windows 的 run_api 使用 Selector event loop，避免 psycopg 与默认 Proactor 不兼容。宿主 POSTGRES_URL 留空时由 POSTGRES_* 字段派生，显式 URL 优先。宿主用 localhost 与映射端口；容器用 postgres:5432、redis:6379。改 REDIS_HOST_PORT 时同时改宿主 REDIS_URL。模板统一使用 PostgreSQL Session/Checkpoint/Memory 与 pgvector；SQLite/Chroma 记忆仍作为离线实验选项保留。
 
 ```bash
 cd web
-npm install
+npm ci
 npm run dev
 ```
 
-Open:
+本地 Web 可将 `.env.example` 复制为 `.env.local`，使用 `VITE_API_BASE_URL=http://127.0.0.1:8000/api`；访问 localhost:5173，设置对应 CORS origins。
 
-```text
-http://127.0.0.1:5173
-```
+模型默认不继承系统代理。宿主通过 MODEL_PROXY_URL 显式配置；Compose 通过 DOCKER_MODEL_PROXY_URL 映射，Docker Desktop 可用 host.docker.internal。不要在公开文档或日志中保存个人代理凭据。
 
-## 3. Recommended Portfolio Deployment
+## 安全与排障
 
-You can use either a single VPS or a split deployment.
+REST 使用 Bearer JWT；WebSocket 在连接后 5 秒内用 auth 首帧发送 JWT，URL 不接受 token。公网使用 HTTPS/WSS，还需自行设置注册/访问控制和模型额度。本项目未承诺商业多租户治理能力。
 
-Single VPS deployment:
+上传默认允许 PDF/PNG/JPG/JPEG，10 MiB；Nginx 20 MiB 为 multipart 开销留余量。准备任务默认 240 秒、解析 60 秒，每用户同时一个分析或解析；Redis 不可用时拒绝新准备。实际续跑可消费剩余预算，单纯刷新不会补充或扣减预算。
 
-- `web` listens on port `80`.
-- `web` serves the React static build.
-- `web` proxies `/api` and WebSocket traffic to `api:8000`.
-- `api` is only bound to `127.0.0.1:${API_HOST_PORT:-8000}` on the server for debugging.
-
-Split deployment:
-
-- Backend: Render, Railway, Fly.io, or a VPS with Docker Compose.
-- Frontend: Vercel, Netlify, Cloudflare Pages, or any static hosting.
-
-Production URL shape:
-
-```text
-https://interview.your-domain.com  -> web frontend
-https://api.your-domain.com        -> FastAPI backend
-wss://api.your-domain.com/api/ws/interview/{session_id}
-```
-
-Set backend:
-
-```env
-CORS_ALLOWED_ORIGINS=https://interview.your-domain.com
-AUTH_SECRET_KEY=change-me-to-a-long-random-secret
-AUTH_TOKEN_EXPIRE_MINUTES=10080
-DEBUG=false
-```
-
-Set frontend:
-
-```env
-VITE_API_BASE_URL=https://api.your-domain.com/api
-```
-
-## 4. Backend Deploy With Docker
-
-The Dockerfile supports dynamic cloud ports:
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
-```
-
-For platforms like Render that inject `PORT`, no extra Dockerfile change is needed.
-
-Important API-container paths:
-
-```text
-/app/chroma_data
-/app/uploads
-/app/exports
-```
-
-`/app/chroma_data` stores the ChromaDB question-bank index. PostgreSQL data is
-stored in the PostgreSQL service volume or an external managed PostgreSQL
-instance; it is the durable source for checkpoints, sessions, and long-term
-memory.
-
-If your platform provides one persistent disk for API-side files, mount it and
-point these paths there:
-
-```env
-CHROMA_PERSIST_DIR=/data/chroma_data
-UPLOAD_DIR=/data/uploads
-EXPORT_DIR=/data/exports
-```
-
-For a managed PostgreSQL deployment, set `POSTGRES_URL` to the managed
-database connection string and keep the three PostgreSQL backend variables
-enabled.
-
-## 5. VPS Deployment With Docker Compose
-
-On the server:
-
-```bash
-git clone https://github.com/08061108/Mockview.git mockview
-cd mockview
-cp .env.example .env
-```
-
-Edit `.env`, then run:
-
-```bash
-docker compose build
-docker compose run --rm api python -m scripts.init_vector_store --reset
-docker compose up -d
-docker compose ps
-docker compose logs -f api
-```
-
-Open:
-
-```text
-http://server-ip
-http://server-ip/health
-http://127.0.0.1:8000/docs
-```
-
-The compose file persists these host directories:
-
-```text
-./postgres_data
-./data
-./chroma_data
-./redis_data
-./uploads
-./exports
-```
-
-`redis_data` stores Redis append-only persistence for runtime cache data. The
-application treats Redis as an enhancement layer, so Redis failures do not erase
-the authoritative PostgreSQL session/checkpoint/memory data or the ChromaDB
-question-bank index.
-
-The API service is deliberately bound to `127.0.0.1` on the VPS. Public users
-should enter through the `web` service, which proxies `/api` and WebSocket
-traffic internally.
-
-## 6. VPS Domain and HTTPS
-
-Point your domain to the VPS IP:
-
-```text
-interview.your-domain.com -> server public IP
-```
-
-For a quick first deploy, you can expose `WEB_PORT=80` and put Caddy on the host:
-
-```caddyfile
-interview.your-domain.com {
-    reverse_proxy 127.0.0.1:80
-}
-```
-
-Then set:
-
-```env
-CORS_ALLOWED_ORIGINS=https://interview.your-domain.com
-VITE_API_BASE_URL=/api
-AUTH_SECRET_KEY=change-me-to-a-long-random-secret
-AUTH_TOKEN_EXPIRE_MINUTES=10080
-DEBUG=false
-```
-
-## 7. Frontend Static Deploy
-
-Build:
-
-```bash
-cd web
-npm install
-npm run build
-```
-
-Deploy `web/dist` to your static hosting provider.
-
-Required production variable:
-
-```env
-VITE_API_BASE_URL=https://api.your-domain.com/api
-```
-
-## 8. Smoke Test Checklist
-
-After deployment:
-
-```text
-1. Open https://interview.your-domain.com/health
-2. Open https://interview.your-domain.com
-3. Register a test account or log in
-4. Start an interview from a real JD
-5. Test resume upload
-6. Answer one question and confirm WebSocket messages work
-7. Stop early and confirm a report is generated
-8. Restart the backend and confirm PostgreSQL/pgvector/Redis-backed data is still present
-```
-
-## 9. Security Notes
-
-- Rotate any API keys that were ever committed or shared.
-- Keep `.env` out of Git and Docker images.
-- Set a long random `AUTH_SECRET_KEY` before sharing a public URL.
-- Set `DEBUG=false` in production.
-- Limit `CORS_ALLOWED_ORIGINS` to the real frontend domain.
-- Back up PostgreSQL volumes before redeploying or moving servers.
+Nginx access log 使用不含 query 的 URI，不记录鉴权头；原生 error log 关闭以避免不可脱敏的 URI。上游反代也需保持该边界。检查顺序是容器状态、health、合成登录、模型与索引配置、任务公开错误；不要开启含真实正文或鉴权帧的日志。

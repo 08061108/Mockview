@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mockview}
       POSTGRES_USER: ${POSTGRES_USER:-mockview}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env}
     volumes:
       - ./postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -40,12 +40,14 @@ services:
       REDIS_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
       CHECKPOINTER_BACKEND: postgres
-      POSTGRES_URL: postgresql://${POSTGRES_USER:-mockview}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-mockview}
+      POSTGRES_URL: postgresql://${POSTGRES_USER:-mockview}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local .env}@postgres:5432/${POSTGRES_DB:-mockview}
       SESSION_STORE_BACKEND: postgres
       MEMORY_STORE_BACKEND: postgres
       MEMORY_VECTOR_BACKEND: pgvector
+      MODEL_PROXY_URL: ${DOCKER_MODEL_PROXY_URL:-}
     volumes:
-      - ./data:/app/data
+      - ./data/question_bank:/app/data/question_bank:ro
+      - ./data/knowledge:/app/data/knowledge
       - ./chroma_data:/app/chroma_data
       - ./uploads:/app/uploads
       - ./exports:/app/exports

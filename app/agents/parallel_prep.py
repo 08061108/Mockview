@@ -28,7 +28,12 @@ async def parallel_analyze(state: InterviewState) -> dict:
     logger.info("Starting parallel analysis (resume + JD)...")
     await emit_status_event("preparing_profile", "正在并行分析 JD 和简历。")
 
-    resume_task = asyncio.create_task(analyze_resume(state))
+    async def resume_or_reuse():
+        if state.get("resume_profile"):
+            return {"resume_profile": state["resume_profile"]}
+        return await analyze_resume(state)
+
+    resume_task = asyncio.create_task(resume_or_reuse())
     jd_task = asyncio.create_task(analyze_jd(state))
 
     resume_result, jd_result = await asyncio.gather(resume_task, jd_task)

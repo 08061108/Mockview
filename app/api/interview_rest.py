@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+import inspect
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -13,11 +14,15 @@ from pydantic import BaseModel, Field
 from app.cache.rate_limiter import check_rate_limit
 from app.cache.session_cache import save_session_meta
 from app.config import settings
+from app.errors import PublicAppError, classify_public_error, document_error, public_http_exception
 from app.models.interview import ChatMessage
+from app.models.public import PublicSessionOverview, PublicSessionState
 from app.models.user import UserInDB
 from app.security import get_current_user
 from app.services.report_exporter import markdown_to_html, report_to_markdown
 from app.services.session_manager import get_session_manager
+from app.services.model_capabilities import get_model_capabilities
+from app.services.public_interview import build_public_report, build_public_transcript, current_public_turn
 from app.utils.file_parser import parse_resume_with_metadata
 
 router = APIRouter()
@@ -38,6 +43,8 @@ class StartInterviewResponse(BaseModel):
 
 class SubmitAnswerRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Candidate answer text")
+    answer_id: str | None = None
+    turn_id: str | None = None
 
 
 def _dump(value: Any) -> Any:
@@ -62,6 +69,14 @@ def _last_interviewer_message(state: dict) -> str | None:
 def _question_meta(state: dict) -> tuple[int, int, list[str], str]:
     plan = state.get("question_plan", []) or []
     idx = int(state.get("current_question_index", 0) or 0)
+    blueprint = state.get("question_blueprint")
+    total = len(plan)
+    if blueprint:
+        total = int(
+            getattr(blueprint, "planned_count", 0)
+            or (blueprint.get("planned_count", 0) if isinstance(blueprint, dict) else 0)
+            or len(plan)
+        )
     if idx < len(plan):
         question = plan[idx]
         skill_tags = getattr(question, "skill_tags", None)
@@ -69,8 +84,8 @@ def _question_meta(state: dict) -> tuple[int, int, list[str], str]:
         if isinstance(question, dict):
             skill_tags = question.get("skill_tags", skill_tags)
             difficulty = question.get("difficulty", difficulty)
-        return idx, len(plan), skill_tags or [], difficulty or ""
-    return idx, len(plan), [], ""
+        return idx, total, skill_tags or [], difficulty or ""
+    return idx, total, [], ""
 
 
 def _current_turn_payload(state: dict) -> dict | None:
@@ -95,6 +110,31 @@ def _current_turn_payload(state: dict) -> dict | None:
             }
         )
     return payload
+
+
+def _current_plan_coverage(state: dict) -> dict:
+    coverage_by_stage = state.get("question_plan_coverage", {}) or {}
+    if state.get("interview_mode") == "professional":
+        stage = (
+            "professional:round2"
+            if "professional:round2" in coverage_by_stage
+            else "professional:round1"
+        )
+    else:
+        stage = "practice"
+    raw = coverage_by_stage.get(stage)
+    coverage = _dump(raw) if raw else {}
+    return {
+        "question_plan_status": coverage.get("status", "not_applicable"),
+        "covered_target_ids": coverage.get("covered_target_ids", []),
+        "uncovered_target_ids": coverage.get("uncovered_target_ids", []),
+        "evidence_eligible_target_ids": coverage.get(
+            "evidence_eligible_target_ids", []
+        ),
+        "evidence_unresolved_target_ids": coverage.get(
+            "evidence_unresolved_target_ids", []
+        ),
+    }
 
 
 def _rate_limit_identity(
@@ -142,35 +182,77 @@ def _report_from_state_or_manager(session_id: str, state: dict) -> Any:
     )
 
 
-def _interview_payload(session_id: str, state: dict) -> dict:
-    mgr = get_session_manager()
+def _public_overview(mgr: Any, session_id: str, state: dict | None = None) -> PublicSessionOverview:
+    if hasattr(mgr, "get_public_overview"):
+        return mgr.get_public_overview(session_id)
     session = mgr.get_session(session_id)
+    state = state or {}
     report = _report_from_state_or_manager(session_id, state)
+    return PublicSessionOverview(
+        session_id=session.session_id,
+        title="面试会话",
+        mode=mgr.get_session_mode(session_id),
+        status=session.status,
+        graph_started=mgr.has_graph_started(session_id),
+        has_report=bool(report),
+        question_count=_question_meta(state)[1],
+        assessment_count=len(state.get("assessments", []) or []),
+        current_question_index=session.current_question_index,
+        max_follow_ups=session.max_follow_ups,
+        jd_preview=" ".join(session.jd_text.split())[:180],
+    )
+
+
+def _public_report(mgr: Any, session_id: str):
+    if hasattr(mgr, "get_public_report"):
+        return mgr.get_public_report(session_id)
+    session = mgr.get_session(session_id)
+    return build_public_report(
+        mgr.get_report_for_session(session_id), completed=session.status == "completed"
+    )
+
+
+async def _interview_payload(session_id: str, state: dict) -> dict:
+    mgr = get_session_manager()
+    if hasattr(mgr, "get_public_state"):
+        public_state = await mgr.get_public_state(session_id)
+    else:
+        overview = _public_overview(mgr, session_id, state)
+        public_state = PublicSessionState(
+            session=overview, graph_started=overview.graph_started,
+            current_turn=current_public_turn(state), has_report=overview.has_report,
+            interview_complete=overview.status == "completed",
+        )
+    report = _public_report(mgr, session_id)
     return {
-        "session": _dump(session),
-        "state": {
-            "interview_complete": bool(state.get("interview_complete", False)),
-            "current_round": state.get("current_round", 1),
-            "question_count": len(state.get("question_plan", []) or []),
-            "assessment_count": len(state.get("assessments", []) or []),
-        },
-        "next": _current_turn_payload(state),
-        "report": _dump(report) if report else None,
+        "session": public_state.session,
+        "state": public_state,
+        "next": public_state.current_turn,
+        "report": report,
     }
 
 
 async def _store_and_parse_resume(session_id: str, upload: UploadFile):
     if not upload.filename:
-        raise HTTPException(status_code=400, detail="Resume file name is required")
+        raise document_error("INVALID_DOCUMENT", "请选择要上传的简历文件。", 422)
     safe_name = Path(upload.filename).name
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in {".pdf", ".png", ".jpg", ".jpeg"}:
+        raise document_error("UNSUPPORTED_FILE_TYPE", "不支持该文件类型，请上传 PDF、PNG、JPG 或 JPEG。", 415)
+    if suffix in {".png", ".jpg", ".jpeg"} and get_model_capabilities()["vision"] == "unavailable":
+        raise PublicAppError("MODEL_NOT_FOUND", "配置的图片识别模型不可用，请联系管理员检查模型配置。", 503)
     upload_dir = settings.upload_root / "resumes" / session_id
     upload_dir.mkdir(parents=True, exist_ok=True)
     file_path = upload_dir / safe_name
     content = await upload.read()
     if not content:
-        raise HTTPException(status_code=400, detail="Resume file is empty")
+        raise document_error("EMPTY_DOCUMENT", "上传的简历文件为空。", 422)
     file_path.write_bytes(content)
-    return await parse_resume_with_metadata(file_path)
+    try:
+        return await parse_resume_with_metadata(file_path)
+    except Exception as exc:
+        file_path.unlink(missing_ok=True)
+        raise classify_public_error(exc) from exc
 
 
 @router.post("/start", response_model=StartInterviewResponse)
@@ -286,7 +368,7 @@ async def get_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     _assert_session_owner(session, current_user)
-    return session
+    return _public_overview(mgr, session_id)
 
 
 @router.post("/session/{session_id}/resume")
@@ -294,14 +376,22 @@ async def upload_resume(
     session_id: str,
     request: Request,
     current_user: Annotated[UserInDB, Depends(get_current_user)],
-    resume_file: UploadFile = File(...),
+    resume_file: UploadFile | None = File(default=None),
 ):
-    """Upload and parse a resume for an existing session before interview start."""
+    """Resume a paused interview, or attach a resume before graph start."""
     mgr = get_session_manager()
     session = await mgr.ensure_session_loaded(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     _assert_session_owner(session, current_user)
+    if resume_file is None:
+        try:
+            return await mgr.resume_interview(session_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "INTERVIEW_CONFLICT", "message": str(exc),
+                "retryable": False, "retry_after_seconds": None,
+            }) from exc
     await _enforce_rate_limit(
         "interview:resume",
         _rate_limit_identity(request, user_id=session.user_id, session_id=session_id),
@@ -316,12 +406,36 @@ async def upload_resume(
             resume_parse_result=parse_result,
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "INTERVIEW_CONFLICT", "message": str(exc), "retryable": False, "retry_after_seconds": None},
+        ) from exc
+    except Exception as exc:
+        raise public_http_exception(exc) from exc
     return {
         "session_id": session_id,
         "resume": _dump(parse_result),
         "message": "Resume parsed and attached to session.",
     }
+
+
+@router.post("/session/{session_id}/pause")
+async def pause_session(
+    session_id: str,
+    current_user: Annotated[UserInDB, Depends(get_current_user)],
+):
+    mgr = get_session_manager()
+    session = await mgr.ensure_session_loaded(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _assert_session_owner(session, current_user)
+    try:
+        return await mgr.request_pause(session_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "INTERVIEW_CONFLICT", "message": str(exc),
+            "retryable": False, "retry_after_seconds": None,
+        }) from exc
 
 
 @router.post("/session/{session_id}/start")
@@ -336,10 +450,13 @@ async def start_session_graph(
         raise HTTPException(status_code=404, detail="Session not found")
     _assert_session_owner(session, current_user)
     try:
-        state = await mgr.start_interview_graph(session_id)
+        if hasattr(mgr, "ensure_start_task"):
+            state = await mgr.ensure_start_task(session_id)
+        else:
+            state = await mgr.start_interview_graph(session_id)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to start interview: {exc}") from exc
-    return _interview_payload(session_id, state)
+        raise public_http_exception(exc) from exc
+    return await _interview_payload(session_id, state)
 
 
 @router.post("/session/{session_id}/answer")
@@ -365,12 +482,22 @@ async def submit_session_answer(
     if not answer:
         raise HTTPException(status_code=400, detail="Answer cannot be empty")
     try:
-        state = await mgr.submit_answer(session_id, answer)
+        answer_id = req.answer_id or uuid.uuid4().hex
+        if hasattr(mgr, "accept_answer_submission"):
+            await mgr.accept_answer_submission(session_id, answer, answer_id, req.turn_id)
+        if hasattr(mgr, "ensure_answer_task"):
+            state = await mgr.ensure_answer_task(session_id, answer, answer_id)
+        else:
+            parameters = inspect.signature(mgr.submit_answer).parameters
+            if "answer_id" in parameters:
+                state = await mgr.submit_answer(session_id, answer, answer_id=answer_id)
+            else:
+                state = await mgr.submit_answer(session_id, answer)
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "INTERVIEW_CONFLICT", "message": str(exc), "retryable": False, "retry_after_seconds": None}) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to process answer: {exc}") from exc
-    return _interview_payload(session_id, state)
+        raise public_http_exception(exc) from exc
+    return await _interview_payload(session_id, state)
 
 
 @router.post("/session/{session_id}/stop")
@@ -385,10 +512,19 @@ async def stop_session(
         raise HTTPException(status_code=404, detail="Session not found")
     _assert_session_owner(session, current_user)
     try:
-        state = await mgr.stop_interview(session_id)
+        state = await mgr.ensure_end_task(session_id)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to stop interview: {exc}") from exc
-    return _interview_payload(session_id, state)
+        raise public_http_exception(exc) from exc
+    return await _interview_payload(session_id, state)
+
+
+@router.post("/session/{session_id}/end")
+async def end_session(
+    session_id: str,
+    current_user: Annotated[UserInDB, Depends(get_current_user)],
+):
+    """Preferred early-completion endpoint; /stop is a compatibility alias."""
+    return await stop_session(session_id, current_user)
 
 
 @router.get("/session/{session_id}/state")
@@ -402,14 +538,20 @@ async def get_session_state(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     _assert_session_owner(session, current_user)
-    state = await mgr.get_last_state(session_id)
-    return {
-        "session": _dump(session),
-        "graph_started": mgr.has_graph_started(session_id),
-        "state": _dump(state),
-        "next": _current_turn_payload(state),
-        "report": _dump(_report_from_state_or_manager(session_id, state)),
-    }
+    return await mgr.get_public_state(session_id)
+
+
+@router.get("/session/{session_id}/transcript")
+async def get_session_transcript(
+    session_id: str,
+    current_user: Annotated[UserInDB, Depends(get_current_user)],
+):
+    mgr = get_session_manager()
+    session = await mgr.ensure_session_loaded(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _assert_session_owner(session, current_user)
+    return await mgr.get_public_transcript(session_id)
 
 
 @router.get("/report/{session_id}")
@@ -425,7 +567,7 @@ async def get_report(
     _assert_session_owner(session, current_user)
     if session.status != "completed":
         raise HTTPException(status_code=400, detail="Interview not yet completed")
-    report = mgr.get_report_for_session(session_id)
+    report = _public_report(mgr, session_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
     return report
@@ -445,12 +587,20 @@ async def export_report(
     _assert_session_owner(session, current_user)
     if session.status != "completed":
         raise HTTPException(status_code=400, detail="Interview not yet completed")
-    report = mgr.get_report_for_session(session_id)
+    report = _public_report(mgr, session_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
     mode = mgr.get_session_mode(session_id)
-    markdown = report_to_markdown(report, mode=mode, session_id=session_id)
+    if hasattr(mgr, "get_public_transcript"):
+        transcript = await mgr.get_public_transcript(session_id)
+    else:
+        state = await mgr.get_last_state(session_id)
+        transcript = build_public_transcript(
+            session=session, overview=_public_overview(mgr, session_id, state),
+            state=state, pending_answers={}, report=mgr.get_report_for_session(session_id),
+        )
+    markdown = report_to_markdown(report, mode=mode, session_id=session_id, transcript=transcript)
     normalized_format = format.lower().strip()
     filename_base = f"interview-report-{session_id[:8]}"
     if normalized_format in {"html", "pdf"}:

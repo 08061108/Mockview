@@ -201,7 +201,11 @@ class ResumeJDMatch(BaseModel):
     )
     missing_skills: list[str] = Field(
         default_factory=list,
-        description="Important JD skills not clearly found in the resume",
+        description="Compatibility alias for important JD skills not mentioned in the resume",
+    )
+    unmentioned_skills: list[str] = Field(
+        default_factory=list,
+        description="Important JD skills not evidenced in the resume; this does not mean inability",
     )
     relevant_projects: list[str] = Field(
         default_factory=list,
@@ -214,4 +218,8 @@ class ResumeJDMatch(BaseModel):
     project_skill_map: dict[str, list[str]] = Field(
         default_factory=dict,
         description="Mapping from project name to matched JD skills",
+    )
+    match_evidence: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Resume terms or aliases supporting each deterministic skill match",
     )

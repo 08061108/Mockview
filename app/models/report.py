@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 class SkillScore(BaseModel):
     skill_name: str
-    score: int = Field(..., ge=1, le=10)
+    score: float = Field(..., ge=1, le=10)
     evidence: str = Field(..., description="来自面试记录的具体评分依据，必须使用简体中文")
 
 
@@ -22,8 +22,10 @@ class InterviewReport(BaseModel):
     """Final structured evaluation report used for single-round evaluation."""
 
     skill_scores: list[SkillScore] = Field(..., description="Per-skill dimension scores")
-    overall_score: float = Field(..., ge=1.0, le=10.0, description="Weighted average score")
-    grade: Literal["A", "B", "C", "D"] = Field(..., description="Overall grade")
+    overall_score: float | None = Field(default=None, ge=1.0, le=10.0, description="Weighted average score")
+    grade: Literal["A", "B", "C", "D"] | None = Field(default=None, description="Overall grade")
+    coverage: dict = Field(default_factory=dict)
+    total_questions: int | None = None
     strengths: list[ReportHighlight] = Field(
         ..., min_length=1, max_length=5, description="Top strengths, must be Chinese"
     )
@@ -48,21 +50,23 @@ class ProfessionalReport(BaseModel):
     """Comprehensive evaluation report for dual-round professional interview."""
 
     round_scores: list[RoundScore] = Field(
-        ..., min_length=1, max_length=2, description="Per-round score summaries"
+        default_factory=list, max_length=2, description="Per-round score summaries"
     )
     skill_scores: list[SkillScore] = Field(
         ..., description="Consolidated per-skill scores across both rounds"
     )
-    overall_score: float = Field(
-        ..., ge=1.0, le=10.0, description="Weighted average across both rounds"
+    overall_score: float | None = Field(
+        default=None, ge=1.0, le=10.0, description="Weighted average across both rounds"
     )
-    grade: Literal["A", "B", "C", "D"] = Field(..., description="Overall grade")
-    technical_depth_score: float = Field(
-        ..., ge=1.0, le=10.0, description="Round 1 technical depth score"
+    grade: Literal["A", "B", "C", "D"] | None = Field(default=None, description="Overall grade")
+    technical_depth_score: float | None = Field(
+        default=None, ge=1.0, le=10.0, description="Round 1 technical depth score"
     )
-    technical_breadth_score: float = Field(
-        ..., ge=1.0, le=10.0, description="Round 2 technical breadth score"
+    technical_breadth_score: float | None = Field(
+        default=None, ge=1.0, le=10.0, description="Round 2 technical breadth score"
     )
+    coverage: dict = Field(default_factory=dict)
+    total_questions: int | None = None
     strengths: list[ReportHighlight] = Field(
         ..., min_length=1, max_length=5, description="Top strengths, must be Chinese"
     )
@@ -80,8 +84,8 @@ class ProfessionalReport(BaseModel):
 class Round1Summary(BaseModel):
     """Intermediate summary after Round 1 of a professional interview."""
 
-    round1_score: float = Field(..., ge=1.0, le=10.0, description="Round 1 overall score")
-    round1_grade: Literal["A", "B", "C", "D"] = Field(..., description="Round 1 grade")
+    round1_score: float | None = Field(default=None, ge=1.0, le=10.0, description="Round 1 overall score")
+    round1_grade: Literal["A", "B", "C", "D"] | None = Field(default=None, description="Round 1 grade")
     technical_depth_assessment: str = Field(
         ..., description="2-3 句技术深度评价，必须使用简体中文"
     )
@@ -104,7 +108,9 @@ class MissedKnowledge(BaseModel):
     """A knowledge point the candidate missed or answered incorrectly."""
 
     question: str = Field(..., description="面试题正文，必须使用简体中文")
-    score: int = Field(..., ge=1, le=10, description="Score for this question")
+    question_id: str | None = Field(default=None, description="Exact stable question_id from final assessment")
+    score: int | None = Field(default=None, ge=1, le=10, description="Final score; null means unscored")
+    scorable: bool = True
     missed_points: list[str] = Field(..., description="候选人遗漏的关键点，必须使用简体中文")
     reference_answer: str = Field(..., description="覆盖关键点的参考答案，必须使用简体中文")
 
@@ -112,8 +118,8 @@ class MissedKnowledge(BaseModel):
 class PracticeReport(BaseModel):
     """Evaluation report for practice mode with reference answers for learning."""
 
-    overall_score: float = Field(..., ge=1.0, le=10.0, description="Weighted average score")
-    grade: Literal["A", "B", "C", "D"] = Field(..., description="Overall grade")
+    overall_score: float | None = Field(default=None, ge=1.0, le=10.0, description="Weighted average score")
+    grade: Literal["A", "B", "C", "D"] | None = Field(default=None, description="Overall grade")
     total_questions: int = Field(..., description="Total questions answered")
     skill_scores: list[SkillScore] = Field(..., description="Per-skill dimension scores")
     missed_knowledge: list[MissedKnowledge] = Field(
@@ -125,3 +131,4 @@ class PracticeReport(BaseModel):
     overall_assessment: str = Field(
         ..., description="2-3 句鼓励性总结和后续行动建议，必须使用简体中文"
     )
+    coverage: dict = Field(default_factory=dict)

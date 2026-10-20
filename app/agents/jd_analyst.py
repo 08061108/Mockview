@@ -19,6 +19,9 @@ async def analyze_jd(state: InterviewState) -> dict:
     Reads:  state["jd_text"]
     Writes: state["skill_matrix"]
     """
+    if state.get("skill_matrix"):
+        await emit_status_event("jd_reused", "已复用本场冻结的 JD 分析结果。")
+        return {"skill_matrix": state["skill_matrix"]}
     jd_text = state["jd_text"]
     logger.info("Analyzing JD (%d chars)...", len(jd_text))
     await emit_status_event("analyzing_jd", "正在分析岗位 JD 和技能要求。")
@@ -31,6 +34,7 @@ async def analyze_jd(state: InterviewState) -> dict:
         ],
         response_model=SkillMatrix,
         temperature=0.3,
+        strategy="simple",
     )
 
     logger.info(

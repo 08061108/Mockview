@@ -1,0 +1,21 @@
+{
+  "category": "RAG",
+  "provenance": "Synthetic demonstration written for Mockview publication preparation, 2026-10-20; not copied from the historical corpus or a third-party question bank.",
+  "purpose": "Installation and mechanism demonstration only; not a benchmark or comprehensive interview bank.",
+  "questions": [
+    {
+      "id": "mockview-demo-rag-001",
+      "content": "在一个合成文档问答系统中，如何结合向量检索与 BM25，并避免重复文档占满上下文？",
+      "skill_tags": ["RAG"],
+      "difficulty": "medium",
+      "reference_points": [
+        "向量检索提供语义相近的候选，BM25 提供词项匹配的候选。",
+        "可以按排名使用 RRF 融合多路候选，再按父文档标识去重。",
+        "没有充分检索证据时应明确缺口，不把模型猜测当成资料事实。"
+      ],
+      "follow_up_directions": ["如果向量检索暂时失败，如何呈现检索降级状态？"],
+      "source": "Mockview synthetic example, AI-assisted",
+      "license_status": "Project owner license selection pending; no third-party corpus included."
+    }
+  ]
+}

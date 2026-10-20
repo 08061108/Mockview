@@ -7,12 +7,14 @@ import pytest
 from app.agents import interviewer
 from app.models.question import QuestionItem
 from app.services.session_manager import SessionManager
+from app.services.operation_store import reset_operation_store
 from app.streaming import (
     SessionEventBus,
     emit_status_event,
     reset_stream_sink,
     set_stream_sink,
 )
+from app.api import interview_ws
 
 
 class FakeStreamingLLM:
@@ -71,13 +73,40 @@ async def test_ask_question_streams_chunks_and_returns_complete_state(monkeypatc
     assert all(event["total_questions"] == 1 for event in events)
     assert all(event["skill_tags"] == ["Python", "LangGraph"] for event in events)
     assert all(event["difficulty"] == "medium" for event in events)
+    assert all(event["question_id"] for event in events)
+    assert all(event["turn_id"].endswith(":main") for event in events)
     assert result["conversation_history"][0].content == "第一段第二段"
     assert llm.chat_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_streaming_falls_back_to_chat_before_first_chunk(monkeypatch):
-    llm = FakeStreamingLLM(stream_error=RuntimeError("provider streaming unavailable"))
+async def test_streaming_does_not_replay_unknown_failure_before_first_chunk(monkeypatch):
+    llm = FakeStreamingLLM(stream_error=RuntimeError("connection interrupted"))
+    events: list[dict] = []
+
+    async def sink(event: dict) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(interviewer, "get_llm_client", lambda: llm)
+    token = set_stream_sink(sink)
+    try:
+        with pytest.raises(RuntimeError, match="connection interrupted"):
+            await interviewer.ask_question(_state())
+    finally:
+        reset_stream_sink(token)
+
+    assert [event["event"] for event in events] == ["start"]
+    assert llm.chat_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_streaming_falls_back_only_when_provider_explicitly_rejects_stream(monkeypatch):
+    class UnsupportedStreamError(RuntimeError):
+        status_code = 400
+
+    llm = FakeStreamingLLM(
+        stream_error=UnsupportedStreamError("stream is not supported by this model")
+    )
     events: list[dict] = []
 
     async def sink(event: dict) -> None:
@@ -92,8 +121,6 @@ async def test_streaming_falls_back_to_chat_before_first_chunk(monkeypatch):
 
     assert result["conversation_history"][0].content == "fallback question"
     assert [event["event"] for event in events] == ["start", "delta", "end"]
-    assert events[1]["chunk"] == "fallback question"
-    assert events[-1]["done"] is True
     assert llm.chat_calls == 1
 
 
@@ -157,6 +184,29 @@ async def test_session_event_bus_fans_out_bounded_events():
     bus.unsubscribe(second)
     await bus.publish({"type": "status", "stage": "four", "message": "4"})
     assert (await first.get())["sequence"] == 3
+
+
+@pytest.mark.asyncio
+async def test_session_event_sequence_persists_replayable_events_without_token_content(monkeypatch):
+    saved = []
+
+    async def latest(_session_id):
+        return 5
+
+    async def save(session_id, sequence, event_id, event):
+        saved.append((session_id, sequence, event_id, event))
+
+    monkeypatch.setattr("app.streaming.latest_session_event_sequence", latest)
+    monkeypatch.setattr("app.streaming.save_session_event", save)
+    bus = SessionEventBus("session-events", max_queue_size=8)
+    queue = bus.subscribe(after_sequence=5)
+    await bus.publish({"type": "status", "stage": "planning", "message": "ready"})
+    await bus.publish({"event": "delta", "stream_id": "stream-1", "chunk": "secret token"})
+    await bus.publish({"event": "end", "stream_id": "stream-1", "content": "complete"})
+
+    assert [item[1] for item in saved] == [6, 8]
+    assert all("secret token" not in str(item) for item in saved)
+    assert [(await queue.get())["sequence"] for _ in range(3)] == [6, 7, 8]
 
 
 @pytest.mark.asyncio
@@ -243,3 +293,117 @@ async def test_background_start_task_is_shared_and_publishes_events(monkeypatch)
     assert calls == 1
     assert first_event["event"]["event"] == "start"
     assert second_event["event"]["event"] == "end"
+
+
+@pytest.mark.asyncio
+async def test_websocket_heartbeat_keeps_exactly_one_queue_consumer(monkeypatch):
+    class CountingQueue(asyncio.Queue):
+        def __init__(self):
+            super().__init__()
+            self.get_calls = 0
+
+        async def get(self):
+            self.get_calls += 1
+            return await super().get()
+
+    class WebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, payload):
+            self.messages.append(payload)
+
+    class Manager:
+        def unsubscribe_events(self, _session_id, _queue):
+            return None
+
+    async def finish_later():
+        await asyncio.sleep(0.035)
+        return {"interview_complete": False}
+
+    monkeypatch.setattr(interview_ws, "WS_WAIT_HEARTBEAT_SECONDS", 0.01)
+    queue = CountingQueue()
+    result = await interview_ws._wait_for_session_task(
+        WebSocket(),
+        "s1",
+        Manager(),
+        asyncio.create_task(finish_later()),
+        queue,
+        {},
+    )
+    assert result["interview_complete"] is False
+    assert queue.get_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_task_completion_forwards_event_already_taken_by_consumer():
+    class WebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, payload):
+            self.messages.append(payload)
+
+    class Manager:
+        def unsubscribe_events(self, _session_id, _queue):
+            return None
+
+    queue = asyncio.Queue()
+    await queue.put(
+        {
+            "sequence": 1,
+            "event": {
+                "type": "status",
+                "stage": "question_ready",
+                "message": "ready",
+            },
+        }
+    )
+
+    async def complete_now():
+        await asyncio.sleep(0)
+        return {"interview_complete": False}
+
+    websocket = WebSocket()
+    result = await interview_ws._wait_for_session_task(
+        websocket,
+        "simultaneous",
+        Manager(),
+        asyncio.create_task(complete_now()),
+        queue,
+        {},
+    )
+    assert result["interview_complete"] is False
+    assert any(message.get("stage") == "question_ready" for message in websocket.messages)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_is_not_recreated_until_explicit_retry(monkeypatch):
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.operation_store.save_operation", noop)
+    monkeypatch.setattr("app.services.operation_store.load_operation", noop)
+    monkeypatch.setattr("app.services.operation_store.append_operation_event", noop)
+    reset_operation_store()
+    manager = SessionManager()
+    session = manager.create_session("failed-start", "JD for failure")
+    calls = 0
+
+    async def fail(_session_id, *, stream_sink=None):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(manager, "start_interview_graph", fail)
+    first = manager.ensure_start_task(session.session_id)
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await first
+    second = manager.ensure_start_task(session.session_id)
+    assert second is first
+    assert calls == 1
+
+    retried = await manager.retry_start_task(session.session_id, "retry-command-1")
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await retried
+    assert calls == 2

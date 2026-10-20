@@ -10,10 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY app/ ./app/
+COPY scripts/run_api.py scripts/init_vector_store.py ./scripts/
+COPY data/question_bank/mockview_demo.json ./data/question_bank/mockview_demo.json
 
 EXPOSE 8000
 

@@ -42,11 +42,11 @@ async def get_redis() -> Any | None:
         )
         await client.ping()
         _client = client
-        logger.info("Redis connected: %s", settings.redis_url)
+        logger.info("Redis connected")
         return _client
     except Exception:
         if not _logged_unavailable:
-            logger.warning("Redis is enabled but unavailable; Redis features will fail open.")
+            logger.warning("Redis unavailable; preparation admission is disabled until recovery.")
             _logged_unavailable = True
         return None
 

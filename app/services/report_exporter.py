@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html import escape
 from typing import Any
+from app.models.public import PublicInterviewReport, PublicTranscript
 
 
 def _dump(value: Any) -> Any:
@@ -55,7 +56,13 @@ def _bullet_lines(items: list[Any], *, evidence: bool = True) -> list[str]:
     return lines
 
 
-def report_to_markdown(report: Any, *, mode: str, session_id: str) -> str:
+def report_to_markdown(
+    report: PublicInterviewReport,
+    *,
+    mode: str,
+    session_id: str,
+    transcript: PublicTranscript | None = None,
+) -> str:
     """Render a report as Markdown."""
     data = _dump(report) or {}
     lines = [
@@ -70,6 +77,13 @@ def report_to_markdown(report: Any, *, mode: str, session_id: str) -> str:
         _line(data.get("overall_assessment"), "暂无总体评价。"),
         "",
     ]
+
+    if data.get("total_questions") is not None:
+        lines.extend([f"- 最终评价题数：{data['total_questions']}", ""])
+    coverage = data.get("coverage") or {}
+    if coverage:
+        lines.extend([f"- 已评分：{coverage.get('scored_questions', 0)}；未评分：{coverage.get('unscored_questions', 0)}",
+                      "- 未覆盖能力：" + "、".join(coverage.get("uncovered_skills") or []), ""])
 
     if data.get("hiring_recommendation"):
         lines.extend(["## 面试结论", _line(data.get("hiring_recommendation")), ""])
@@ -93,7 +107,7 @@ def report_to_markdown(report: Any, *, mode: str, session_id: str) -> str:
                 lines.append(f"- {item}")
                 continue
             lines.append(f"### {_line(item.get('question'), '问题')}")
-            lines.append(f"- 得分：{_line(item.get('score'), '?')}/10")
+            lines.append(f"- 得分：{item['score']}/10" if item.get('score') is not None else "- 得分：未评分")
             missed = item.get("missed_points") or []
             if missed:
                 lines.append("- 遗漏点：" + "；".join(str(point) for point in missed))
@@ -103,6 +117,18 @@ def report_to_markdown(report: Any, *, mode: str, session_id: str) -> str:
 
     if data.get("study_suggestions"):
         lines.extend(["## 学习建议", *_bullet_lines(data["study_suggestions"], evidence=False), ""])
+
+    transcript_data = _dump(transcript) or {}
+    items = transcript_data.get("items", []) if isinstance(transcript_data, dict) else []
+    if items:
+        lines.append("## 完整面试记录")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = {"interviewer": "AI 面试官", "candidate": "我的回答", "system": "系统"}.get(
+                item.get("role"), "消息"
+            )
+            lines.extend([f"### {role}", _line(item.get("content")), ""])
 
     return "\n".join(lines).strip() + "\n"
 

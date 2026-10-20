@@ -34,7 +34,6 @@ pytest-cache-files-*/
 htmlcov/
 .coverage
 data/eval/results/
-
 *.log
 
 node_modules/
@@ -48,3 +47,81 @@ web/.tmp-vite*.log
 
 exports/
 uploads/
+
+# Secret variants (examples are safe templates)
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.sql
+*.dump
+# Local/private material. Tracked files still require an explicit later decision.
+*.zip
+*.7z
+*.tar
+*.tar.gz
+PROJECT_PLAN.md
+提升规划.md
+docs/study/
+docs/AI产品经理求职文案与补强方案.md
+docs/p0-p6-delivery.md
+docs/question-generation-architecture-review-2026-10-15.md
+docs/question-generation-implementation-2026-10-16.md
+docs/runtime-issues-2026-10-14.md
+docs/course_agent_project_report.md
+docs/project_showcase_summary.md
+docs/rag_eval_report.md
+docs/ragas_evaluation_upgrade.md
+# Existing corpus/eval provenance review is pending. A new synthetic demo is public.
+data/question_bank/*.json
+!data/question_bank/mockview_demo.json
+data/knowledge/
+data/eval/*.json
+tests/test_evidence_regression_frozen_cases.py
+
+# Superseded design notes stay local; current public docs have explicit names.
+docs/fastapi_websocket_contract.md
+docs/postgres_checkpoint.md
+docs/rag_design.md
+docs/redis_design.md
+docs/scoring_rubric.md
+data/sample_jds/
+
+# Historical diagnostics/private acceptance scripts (tracked entries need later review).
+scripts/accept_agentic_business_closure.py
+scripts/accept_evidence_boundary_real.py
+scripts/accept_p1_business.py
+scripts/accept_p1_real_e2e.py
+scripts/accept_replayed_agent_question.py
+scripts/diagnose_model_transport.py
+scripts/eval_usage.py
+scripts/evaluate.py
+scripts/evaluate_agentic_default_gate.py
+scripts/evaluate_agentic_natural_ab.py
+scripts/evaluate_agentic_value.py
+scripts/evaluate_dprod.py
+scripts/evaluate_p0_baseline.py
+scripts/evaluate_p6_candidate.py
+scripts/evaluate_public_incremental.py
+scripts/evaluate_rag_fix_smoke.py
+scripts/evaluate_semantic_shadow.py
+scripts/evaluate_tavily_exploratory.py
+scripts/inspect_memory.py
+scripts/p0_sitecustomize.py
+scripts/probe_external_services.py
+scripts/probe_progressive_question.py
+scripts/probe_question_generation_params.py
+scripts/probe_tavily.py
+scripts/run_frozen_p0.py
+scripts/run_interview_cli.py
+scripts/test_retrieval.py
+scripts/test_vision.py
+scripts/test_ws_client.py
+scripts/validate_real_agent_tool_calling.py
+scripts/verify_postgres_recovery.py
+scripts/verify_question_generation_postgres.py
+frontend/*.py

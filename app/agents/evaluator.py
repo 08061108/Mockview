@@ -5,6 +5,8 @@ Also includes the round1_summary node for intermediate feedback in dual-round mo
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import logging
 
 from app.agents.state import InterviewState
@@ -16,9 +18,74 @@ from app.llm.prompts import (
     ROUND1_SUMMARY_SYSTEM,
 )
 from app.models.interview import ChatMessage
-from app.models.report import InterviewReport, PracticeReport, ProfessionalReport, Round1Summary
+from app.models.report import (
+    InterviewReport,
+    PracticeReport,
+    ProfessionalReport,
+    Round1Summary,
+    RoundScore,
+    SkillScore,
+    MissedKnowledge,
+)
+from app.models.interview import FinalQuestionAssessment
+from app.domain.skill_identity import canonical_skill_id
+from app.services.scoring import aggregate_professional_rounds, aggregate_scores, grade_for_score
 
 logger = logging.getLogger(__name__)
+
+
+def _final_items(raw: dict | None) -> list[FinalQuestionAssessment]:
+    return [
+        item if isinstance(item, FinalQuestionAssessment) else FinalQuestionAssessment.model_validate(item)
+        for item in (raw or {}).values()
+    ]
+
+
+def _coverage(summary) -> dict:
+    return {
+        "covered_skills": summary.covered_skills,
+        "uncovered_skills": summary.uncovered_skills,
+        "scored_questions": summary.scored_questions,
+        "unscored_questions": summary.unscored_questions,
+    }
+
+
+def _deterministic_skill_scores(summary, items: list[FinalQuestionAssessment]) -> list[SkillScore]:
+    rows = []
+    for skill, score in summary.skill_scores.items():
+        evidence = []
+        for item in items:
+            if canonical_skill_id(item.primary_skill) == canonical_skill_id(skill):
+                evidence.extend(item.answer_evidence[:2])
+        rows.append(
+            SkillScore(
+                skill_name=skill,
+                score=score,
+                evidence="；".join(evidence[:3]) or "来自最终单题评价。",
+            )
+        )
+    return rows
+
+
+def _deterministic_round_scores(report: ProfessionalReport, r1_summary, r2_summary) -> list[RoundScore]:
+    """Discard model-authored numbers and keep only rounds with valid final scores."""
+    existing = list(report.round_scores)
+    rows: list[RoundScore] = []
+    for index, (name, summary) in enumerate(
+        (("一面（技术深度）", r1_summary), ("二面（技术广度）", r2_summary))
+    ):
+        if summary.overall_score is None or summary.grade is None:
+            continue
+        narrative = existing[index].summary if index < len(existing) else "基于本轮有效单题评价汇总。"
+        rows.append(
+            RoundScore(
+                round_name=name,
+                score=summary.overall_score,
+                grade=summary.grade,
+                summary=narrative,
+            )
+        )
+    return rows
 
 
 # ── Shared formatting helpers ────────────────────────────────────────
@@ -42,12 +109,39 @@ def _format_transcript(state: InterviewState) -> str:
 
 def _format_assessments(state: InterviewState) -> str:
     lines = []
-    for a in state.get("assessments", []):
+    for a in _final_items(state.get("final_question_assessments")):
         lines.append(
-            f"Q{a.question_id}: score={a.score}/10, "
+            f"question_id={a.question_id}, Q{a.display_id}: final_score={a.score if a.scorable else None}, "
             f"covered={a.covered_points}, missed={a.missed_points}"
         )
-    return "\n".join(lines) if lines else "No per-question assessments available."
+    summary = aggregate_scores(_final_items(state.get("final_question_assessments")), state.get("skill_matrix"))
+    return ("以下最终单题评价与汇总是唯一权威数值；null 表示未评分。文字叙述只解释证据与建议，"
+            "不要复述或自行推算分数、等级、题目数或覆盖率。不要从过程追问评分再次计算。\n"
+            f"Authoritative summary: {summary}\n" + "\n".join(lines))
+
+
+def _deterministic_missed_knowledge(state, items, generated):
+    questions = {}
+    for key in ("round1_question_plan", "round2_question_plan", "question_plan"):
+        for raw in state.get(key, []) or []:
+            q = raw if isinstance(raw, dict) else raw.model_dump()
+            if q.get("question_id"):
+                questions[q["question_id"]] = q["content"]
+    rows = []
+    for item in items:
+        scored = item.scorable and item.score is not None
+        if scored and item.score >= 8 and not item.missed_points:
+            continue
+        content = questions.get(item.question_id, f"问题 {item.display_id}")
+        matches = [row for row in generated if row.question_id == item.question_id or
+                   (not row.question_id and row.question == content and
+                    list(questions.values()).count(content) == 1)]
+        narrative = matches[0].reference_answer if len(matches) == 1 else "暂无可可靠关联的参考答案，请结合本题反馈复习。"
+        rows.append(MissedKnowledge(question=content, question_id=item.question_id,
+                    score=item.score if scored else None, scorable=scored,
+                    missed_points=item.missed_points if scored else [],
+                    reference_answer=narrative if scored else "本题缺少可靠评分依据，未计入技能分和综合分。"))
+    return rows
 
 
 def _format_skill_matrix(state: InterviewState) -> str:
@@ -68,7 +162,7 @@ def _format_question_plan(state: InterviewState) -> str:
     lines = []
     for q in plan:
         lines.append(
-            f"Q{q.id} [{q.difficulty}]: {q.content}\n"
+            f"question_id={q.question_id}, Q{q.id} [{q.difficulty}]: {q.content}\n"
             f"  Reference points: {', '.join(q.reference_points)}"
         )
     return "\n".join(lines)
@@ -79,31 +173,11 @@ def _format_question_plan(state: InterviewState) -> str:
 
 def _format_round1_data(state: InterviewState) -> str:
     """Format Round 1 assessments for the final evaluator."""
-    r1_assessments = state.get("round1_assessments", [])
-    r1_plan = state.get("round1_question_plan", [])
-    if not r1_assessments:
+    finals = state.get("round1_final_question_assessments") or {}
+    if not finals:
         return ""
-
-    lines = ["## Round 1 (Technical Depth) Assessments"]
-    for a in r1_assessments:
-        lines.append(
-            f"Q{a.question_id}: score={a.score}/10, "
-            f"covered={a.covered_points}, missed={a.missed_points}"
-        )
-
-    summary_raw = state.get("round1_summary_text", "")
-    if summary_raw:
-        try:
-            summary = Round1Summary.model_validate_json(summary_raw)
-            lines.append(
-                f"\nRound 1 Summary: score={summary.round1_score:.1f} ({summary.round1_grade})"
-                f"\n  Depth: {summary.technical_depth_assessment}"
-                f"\n  Projects: {summary.project_understanding}"
-            )
-        except Exception:
-            pass
-
-    return "\n".join(lines)
+    return "## Round 1 Final Assessments\n" + _format_assessments({
+        "final_question_assessments": finals, "skill_matrix": state.get("skill_matrix")})
 
 
 async def evaluate_interview(state: InterviewState) -> dict:
@@ -132,17 +206,12 @@ async def evaluate_interview(state: InterviewState) -> dict:
 
     if is_dual_round:
         user_content += f"{round1_data}\n\n"
-        r1_count = len(state.get("round1_assessments", []))
-        all_assessments = state.get("assessments", [])
-        r2_assessments = all_assessments[r1_count:]
-        if r2_assessments:
-            r2_lines = []
-            for a in r2_assessments:
-                r2_lines.append(
-                    f"Q{a.question_id}: score={a.score}/10, "
-                    f"covered={a.covered_points}, missed={a.missed_points}"
-                )
-            user_content += "## Round 2 (Technical Breadth) Assessments\n" + "\n".join(r2_lines) + "\n\n"
+        user_content += "## All Final Assessments\n" + assessments_text + "\n\n"
+        r1 = aggregate_scores(_final_items(state.get("round1_final_question_assessments")), state.get("skill_matrix"))
+        r1_ids = set(state.get("round1_final_question_assessments") or {})
+        r2 = aggregate_scores([item for item in _final_items(state.get("final_question_assessments"))
+                               if item.question_id not in r1_ids], state.get("skill_matrix"))
+        user_content += f"\nAuthoritative professional overall (55/45): {aggregate_professional_rounds(r1.overall_score, r2.overall_score)}\n"
 
         user_content += (
             f"## Full Interview Transcript (Both Rounds)\n{transcript}\n\n"
@@ -160,8 +229,29 @@ async def evaluate_interview(state: InterviewState) -> dict:
             temperature=0.3,
         )
 
+        r1_items = _final_items(state.get("round1_final_question_assessments"))
+        all_items = _final_items(state.get("final_question_assessments"))
+        r1_ids = {item.question_id for item in r1_items}
+        r2_items = [item for item in all_items if item.question_id not in r1_ids]
+        r1_summary = aggregate_scores(r1_items, state.get("skill_matrix"))
+        r2_summary = aggregate_scores(r2_items, state.get("skill_matrix"))
+        combined = aggregate_scores(all_items, state.get("skill_matrix"))
+        overall = aggregate_professional_rounds(r1_summary.overall_score, r2_summary.overall_score)
+        report = report.model_copy(
+            update={
+                "overall_score": overall,
+                "grade": grade_for_score(overall),
+                "technical_depth_score": r1_summary.overall_score,
+                "technical_breadth_score": r2_summary.overall_score,
+                "round_scores": _deterministic_round_scores(report, r1_summary, r2_summary),
+                "skill_scores": _deterministic_skill_scores(combined, all_items),
+                "coverage": _coverage(combined),
+                "total_questions": combined.scored_questions + combined.unscored_questions,
+            }
+        )
+
         logger.info(
-            "Professional evaluation complete: overall=%.1f (%s), depth=%.1f, breadth=%.1f, rec=%s",
+            "Professional evaluation complete: overall=%s (%s), depth=%s, breadth=%s, rec=%s",
             report.overall_score, report.grade,
             report.technical_depth_score, report.technical_breadth_score,
             report.hiring_recommendation,
@@ -185,8 +275,20 @@ async def evaluate_interview(state: InterviewState) -> dict:
         temperature=0.3,
     )
 
+    final_items = _final_items(state.get("final_question_assessments"))
+    summary = aggregate_scores(final_items, state.get("skill_matrix"))
+    report = report.model_copy(
+        update={
+            "overall_score": summary.overall_score,
+            "grade": summary.grade,
+            "skill_scores": _deterministic_skill_scores(summary, final_items),
+            "coverage": _coverage(summary),
+            "total_questions": summary.scored_questions + summary.unscored_questions,
+        }
+    )
+
     logger.info(
-        "Evaluation complete: overall=%.1f (%s), %d skill scores",
+        "Evaluation complete: overall=%s (%s), %d skill scores",
         report.overall_score, report.grade, len(report.skill_scores),
     )
     return {"final_report": report, "interview_complete": True}
@@ -206,7 +308,7 @@ async def summarize_round1(state: InterviewState) -> dict:
     skill_context = _format_skill_matrix(state)
     question_context = _format_question_plan(state)
 
-    num_assessed = len(state.get("assessments", []))
+    num_assessed = len(state.get("final_question_assessments", {}))
     logger.info("Summarizing Round 1: %d assessments", num_assessed)
 
     user_content = (
@@ -228,14 +330,26 @@ async def summarize_round1(state: InterviewState) -> dict:
         temperature=0.3,
     )
 
+    final_items = _final_items(state.get("final_question_assessments"))
+    score_summary = aggregate_scores(final_items, state.get("skill_matrix"))
+    summary = summary.model_copy(
+        update={
+            "round1_score": score_summary.overall_score,
+            "round1_grade": score_summary.grade,
+        }
+    )
+
     logger.info(
-        "Round 1 summary: score=%.1f (%s), proceed=%s",
+        "Round 1 summary: score=%s (%s), proceed=%s",
         summary.round1_score, summary.round1_grade, summary.proceed_to_round2,
     )
 
     return {
         "round1_question_plan": list(state.get("question_plan", [])),
         "round1_assessments": list(state.get("assessments", [])),
+        "round1_final_question_assessments": dict(
+            state.get("final_question_assessments", {})
+        ),
         "round1_summary_text": summary.model_dump_json(),
         "current_round": 2,
         "current_question_index": 0,
@@ -246,9 +360,14 @@ async def summarize_round1(state: InterviewState) -> dict:
                 content=(
                     f"---\n\n**一面结束 | Round 1 Complete**\n\n"
                     f"{summary.round1_feedback}\n\n"
-                    f"得分: {summary.round1_score:.1f}/10 ({summary.round1_grade})\n\n"
-                    f"---\n\n现在进入二面（技术广度），准备好了吗？"
+                    + (
+                        f"得分: {summary.round1_score:.1f}/10 ({summary.round1_grade})\n\n"
+                        if summary.round1_score is not None
+                        else "得分: 暂无可汇总分数\n\n"
+                    )
+                    + f"---\n\n现在进入二面（技术广度），准备好了吗？"
                 ),
+                created_at=datetime.now(timezone.utc),
             )
         ],
     }
@@ -264,7 +383,7 @@ async def evaluate_practice(state: InterviewState) -> dict:
     skill_context = _format_skill_matrix(state)
     question_context = _format_question_plan(state)
 
-    num_answered = len(state.get("assessments", []))
+    num_answered = len(state.get("final_question_assessments", {}))
     logger.info(
         "Evaluating practice session: %d questions answered, %d assessments",
         num_answered, len(state.get("assessments", [])),
@@ -291,8 +410,21 @@ async def evaluate_practice(state: InterviewState) -> dict:
         temperature=0.3,
     )
 
+    final_items = _final_items(state.get("final_question_assessments"))
+    summary = aggregate_scores(final_items, state.get("skill_matrix"))
+    report = report.model_copy(
+        update={
+            "overall_score": summary.overall_score,
+            "grade": summary.grade,
+            "skill_scores": _deterministic_skill_scores(summary, final_items),
+            "coverage": _coverage(summary),
+            "missed_knowledge": _deterministic_missed_knowledge(state, final_items, report.missed_knowledge),
+            "total_questions": summary.scored_questions + summary.unscored_questions,
+        }
+    )
+
     logger.info(
-        "Practice evaluation complete: overall=%.1f (%s), %d missed knowledge items",
+        "Practice evaluation complete: overall=%s (%s), %d missed knowledge items",
         report.overall_score, report.grade, len(report.missed_knowledge),
     )
     return {"practice_report": report, "interview_complete": True}

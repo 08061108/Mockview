@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -6,9 +7,16 @@ from starlette.websockets import WebSocketDisconnect
 from app.api import interview_rest, interview_ws
 from app.main import app
 from app.models.interview import ChatMessage, InterviewSession
+from app.models.public import PublicSessionOverview, PublicSessionState
 from app.models.resume import ResumeParseMetadata, ResumeParseResult
 from app.models.user import UserInDB
 from app.security import create_access_token, get_current_user
+from app.services.public_interview import (
+    assert_no_forbidden_public_fields,
+    build_public_report,
+    build_public_transcript,
+    current_public_turn,
+)
 
 
 def _fake_user(user_id="user-1") -> UserInDB:
@@ -36,9 +44,11 @@ def _clear_overrides():
     app.dependency_overrides.clear()
 
 
-def _ws_url(session_id: str, user: UserInDB | None = None) -> str:
-    token = create_access_token(user or _fake_user())
-    return f"/api/ws/interview/{session_id}?token={token}"
+@contextmanager
+def _ws_connect(client, session_id, user=None):
+    with client.websocket_connect(f"/api/ws/interview/{session_id}") as ws:
+        ws.send_json({"type": "auth", "token": create_access_token(user or _fake_user())})
+        yield ws
 
 
 async def _fake_get_user_by_id(user_id: str):
@@ -188,6 +198,49 @@ class FakeInterviewManager:
         return self.last_state
 
 
+class PublicContractManager(FakeInterviewManager):
+    """Exercise actual public DTO builders while keeping model calls out of API tests."""
+
+    def get_public_overview(self, session_id):
+        session = self.sessions[session_id]
+        report = self.get_public_report(session_id)
+        return PublicSessionOverview(
+            session_id=session_id,
+            title="后端工程师",
+            mode=getattr(self, "mode", "practice"),
+            status=session.status,
+            graph_started=self.graph_started,
+            has_report=report is not None,
+            assessment_count=len(self.last_state.get("final_question_assessments", {})),
+        )
+
+    async def get_public_state(self, session_id):
+        overview = self.get_public_overview(session_id)
+        return PublicSessionState(
+            session=overview,
+            graph_started=self.graph_started,
+            current_turn=current_public_turn(self.last_state),
+            has_report=overview.has_report,
+            interview_complete=overview.status == "completed",
+        )
+
+    def get_public_report(self, session_id):
+        return build_public_report(
+            self.report,
+            completed=self.sessions[session_id].status == "completed",
+        )
+
+    async def get_public_transcript(self, session_id):
+        session = self.sessions[session_id]
+        return build_public_transcript(
+            session=session,
+            overview=self.get_public_overview(session_id),
+            state=self.last_state,
+            pending_answers={},
+            report=self.report,
+        )
+
+
 class BackgroundResumeManager(FakeInterviewManager):
     """Simulate reconnecting while the initial question stream finishes elsewhere."""
 
@@ -333,7 +386,7 @@ def test_websocket_interview_contract(monkeypatch):
     monkeypatch.setattr(interview_ws, "get_user_by_id", _fake_get_user_by_id)
     client = TestClient(app)
 
-    with client.websocket_connect(_ws_url(session.session_id)) as ws:
+    with _ws_connect(client, session.session_id) as ws:
         assert ws.receive_json()["type"] == "status"
         assert ws.receive_json()["stage"] == "questions_ready"
         question = ws.receive_json()
@@ -349,7 +402,20 @@ def test_websocket_interview_contract(monkeypatch):
 
 
 def test_websocket_reconnect_delivers_question_after_background_stream(monkeypatch):
-    manager = BackgroundResumeManager()
+    class OrderedRecoveryManager(BackgroundResumeManager):
+        def __init__(self):
+            super().__init__()
+            self.recovery_order = []
+
+        def subscribe_events(self, session_id):
+            self.recovery_order.append("subscribe")
+            return super().subscribe_events(session_id)
+
+        async def get_last_state(self, session_id):
+            self.recovery_order.append("read_state")
+            return await super().get_last_state(session_id)
+
+    manager = OrderedRecoveryManager()
     session = manager.create_session(
         session_id="ws-background-resume-session",
         jd_text="Python FastAPI LangGraph AI application developer position",
@@ -359,11 +425,14 @@ def test_websocket_reconnect_delivers_question_after_background_stream(monkeypat
     monkeypatch.setattr(interview_ws, "get_user_by_id", _fake_get_user_by_id)
     client = TestClient(app)
 
-    with client.websocket_connect(_ws_url(session.session_id)) as ws:
+    with _ws_connect(client, session.session_id) as ws:
         assert ws.receive_json()["stage"] == "resumed"
         question = ws.receive_json()
         assert question["type"] == "question"
         assert question["content"] == "Explain how your FastAPI layer drives the Agent workflow."
+    assert manager.recovery_order.index("subscribe") < manager.recovery_order.index(
+        "read_state"
+    )
 
 
 def test_websocket_drops_orphan_stream_end_and_sends_complete_question(monkeypatch):
@@ -377,7 +446,7 @@ def test_websocket_drops_orphan_stream_end_and_sends_complete_question(monkeypat
     monkeypatch.setattr(interview_ws, "get_user_by_id", _fake_get_user_by_id)
     client = TestClient(app)
 
-    with client.websocket_connect(_ws_url(session.session_id)) as ws:
+    with _ws_connect(client, session.session_id) as ws:
         assert ws.receive_json()["stage"] == "analyzing_jd"
         question = ws.receive_json()
         assert question["type"] == "question"
@@ -395,7 +464,7 @@ def test_websocket_start_handshake_does_not_duplicate_question(monkeypatch):
     monkeypatch.setattr(interview_ws, "get_user_by_id", _fake_get_user_by_id)
     client = TestClient(app)
 
-    with client.websocket_connect(_ws_url(session.session_id)) as ws:
+    with _ws_connect(client, session.session_id) as ws:
         assert ws.receive_json()["type"] == "status"
         assert ws.receive_json()["stage"] == "questions_ready"
         assert ws.receive_json()["type"] == "question"
@@ -481,6 +550,137 @@ def test_rest_exports_completed_report(monkeypatch):
         _clear_overrides()
 
 
+def _completed_public_contract_manager():
+    manager = PublicContractManager()
+    session = manager.create_session(
+        session_id="public-contract-session",
+        jd_text="Python FastAPI LangGraph AI application developer position",
+        user_id="user-1",
+    )
+    session.status = "completed"
+    manager.graph_started = True
+    manager.report = {
+        "overall_score": 8.0,
+        "grade": "B",
+        "overall_assessment": "接口设计清晰。",
+        "missed_knowledge": [{
+            "question": "如何保证幂等？",
+            "score": 7,
+            "missed_points": ["稳定请求标识"],
+            "reference_answer": "保存请求标识和操作结果。",
+            "reference_points": ["PRIVATE_REFERENCE_POINT"],
+            "evidence_chunk_ids": ["PRIVATE_EVIDENCE_ID"],
+        }],
+        "question_plan": [{"rubric": "PRIVATE_RUBRIC"}],
+    }
+    manager.last_state = {
+        "interview_complete": True,
+        "question_plan": [{
+            "skill_tags": ["FastAPI"],
+            "difficulty": "medium",
+            "reference_points": ["PRIVATE_STATE_REFERENCE"],
+        }],
+        "conversation_history": [
+            ChatMessage(
+                message_id="q-public-1",
+                role="interviewer",
+                content="如何保证接口幂等？",
+                question_id="question-1",
+                turn_id="turn-1",
+                kind="main",
+            ),
+            ChatMessage(
+                message_id="a-public-1",
+                role="candidate",
+                content="我会保存请求标识和操作结果。",
+                question_id="question-1",
+                turn_id="turn-1",
+                answer_id="answer-1",
+            ),
+        ],
+        "final_question_assessments": {
+            "question-1": {
+                "observation_id": "observation-1",
+                "question_id": "question-1",
+                "display_id": 1,
+                "primary_skill": "FastAPI",
+                "score": 8,
+                "covered_points": ["PRIVATE_COVERED_POINT"],
+                "rubric_version": "PRIVATE_RUBRIC_VERSION",
+            }
+        },
+    }
+    return manager, session
+
+
+def test_public_rest_and_export_outputs_recursively_exclude_internal_fields(monkeypatch):
+    manager, session = _completed_public_contract_manager()
+    monkeypatch.setattr(interview_rest, "get_session_manager", lambda: manager)
+    client = _client_with_user(_fake_user("user-1"))
+
+    try:
+        for path in (
+            f"/api/interview/session/{session.session_id}",
+            f"/api/interview/session/{session.session_id}/state",
+            f"/api/interview/session/{session.session_id}/transcript",
+            f"/api/interview/report/{session.session_id}",
+        ):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert_no_forbidden_public_fields(response.json())
+        state = client.get(f"/api/interview/session/{session.session_id}/state").json()
+        assert "state" not in state
+
+        transcript = client.get(
+            f"/api/interview/session/{session.session_id}/transcript"
+        ).json()
+        assert [item["role"] for item in transcript["items"]] == [
+            "interviewer",
+            "candidate",
+        ]
+        assert transcript["question_reviews"][0]["score"] == 8
+        assert transcript["report"]["missed_knowledge"][0]["reference_answer"]
+
+        for format_name in ("markdown", "html"):
+            exported = client.get(
+                f"/api/interview/report/{session.session_id}/export?format={format_name}"
+            )
+            assert exported.status_code == 200
+            assert "我会保存请求标识和操作结果" in exported.text
+            for private_value in (
+                "PRIVATE_REFERENCE_POINT",
+                "PRIVATE_EVIDENCE_ID",
+                "PRIVATE_RUBRIC",
+                "PRIVATE_STATE_REFERENCE",
+                "PRIVATE_COVERED_POINT",
+                "PRIVATE_RUBRIC_VERSION",
+            ):
+                assert private_value not in exported.text
+    finally:
+        _clear_overrides()
+
+
+def test_websocket_transcript_snapshot_uses_public_projection(monkeypatch):
+    manager, session = _completed_public_contract_manager()
+    monkeypatch.setattr(interview_ws, "get_session_manager", lambda: manager)
+    monkeypatch.setattr(interview_ws, "get_user_by_id", _fake_get_user_by_id)
+    client = TestClient(app)
+
+    with _ws_connect(client, session.session_id) as ws:
+        snapshot = ws.receive_json()
+        assert snapshot["type"] == "transcript_snapshot"
+        assert_no_forbidden_public_fields(snapshot)
+        assert [item["role"] for item in snapshot["data"]["items"]] == [
+            "interviewer",
+            "candidate",
+        ]
+        assert ws.receive_json()["stage"] == "resumed"
+        assert ws.receive_json()["type"] == "interview_end"
+        report = ws.receive_json()
+        assert report["type"] == "report"
+        assert_no_forbidden_public_fields(report)
+
+
 def test_websocket_requires_authentication(monkeypatch):
     manager = FakeInterviewManager()
     session = manager.create_session(
@@ -492,7 +692,9 @@ def test_websocket_requires_authentication(monkeypatch):
     client = TestClient(app)
 
     try:
-        with client.websocket_connect(f"/api/ws/interview/{session.session_id}"):
+        with client.websocket_connect(f"/api/ws/interview/{session.session_id}") as ws:
+            ws.send_json({"type": "auth"})
+            ws.receive_json()
             raise AssertionError("WebSocket should reject a missing auth token")
     except WebSocketDisconnect as exc:
         assert exc.code == 4401
@@ -510,7 +712,8 @@ def test_websocket_rejects_cross_user_session(monkeypatch):
     client = TestClient(app)
 
     try:
-        with client.websocket_connect(_ws_url(session.session_id, _fake_user("user-1"))):
+        with _ws_connect(client, session.session_id, _fake_user("user-1")) as ws:
+            ws.receive_json()
             raise AssertionError("WebSocket should reject cross-user access")
     except WebSocketDisconnect as exc:
         assert exc.code == 4403

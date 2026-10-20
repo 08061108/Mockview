@@ -5,6 +5,7 @@ import pytest
 
 from app.memory.service import MemoryService
 from app.memory.store import MemoryStore
+from app.memory.models import MemoryItem, MemoryType
 from app.models.interview import AnswerAssessment
 from app.models.question import QuestionItem
 from app.models.report import PracticeReport, SkillScore
@@ -134,3 +135,32 @@ async def test_memory_service_semantic_recall_uses_vector_index():
     assert context.semantic_memories
     assert context.semantic_memories[0].id == episode.id
     assert context.semantic_memories[0].structured["_semantic_score"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_fact_correction_replaces_old_fact_and_marks_projection_complete():
+    db_dir = Path("memory_data")
+    db_dir.mkdir(exist_ok=True)
+    store = MemoryStore(db_dir / f"test_fact_correction_{uuid4().hex}.db")
+    vector_store = FakeMemoryVectorStore()
+    service = MemoryService(store, vector_store=vector_store)
+    old = store.upsert_memory_item(
+        MemoryItem(
+            id="old-fact",
+            user_id="u3",
+            memory_type=MemoryType.PROFILE,
+            content="旧事实",
+            structured={"validity": "valid"},
+        )
+    )
+
+    replacement = await service.correct_fact("u3", "新事实", old.id)
+    persisted_old = store.get_memory_item(old.id)
+    persisted_new = store.get_memory_item(replacement.id)
+
+    assert persisted_old is not None
+    assert persisted_old.structured["validity"] == "replaced"
+    assert persisted_old.structured["replaced_by"] == replacement.id
+    assert persisted_new is not None
+    assert persisted_new.structured["projection_status"] == "completed"
+    assert replacement.id in vector_store.items

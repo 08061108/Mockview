@@ -35,11 +35,14 @@ from app.agents.interviewer import (
     ask_follow_up,
     ask_question,
     assess_answer,
+    finalize_question_assessment,
     route_after_assessment,
+    route_after_final_assessment,
 )
 from app.agents.jd_analyst import analyze_jd
 from app.agents.parallel_prep import parallel_analyze
 from app.agents.question_planner import (
+    generate_current_question,
     plan_questions,
     plan_questions_round2,
     plan_questions_with_resume,
@@ -55,15 +58,18 @@ def build_practice_graph():
 
     graph.add_node("analyze_jd", analyze_jd)
     graph.add_node("plan_questions", plan_questions)
+    graph.add_node("generate_question", generate_current_question)
     graph.add_node("ask_question", ask_question)
     graph.add_node("ask_follow_up", ask_follow_up)
     graph.add_node("assess_answer", assess_answer)
+    graph.add_node("finalize_question", finalize_question_assessment)
     graph.add_node("advance_question", advance_question)
     graph.add_node("evaluate_practice", evaluate_practice)
 
     graph.set_entry_point("analyze_jd")
     graph.add_edge("analyze_jd", "plan_questions")
-    graph.add_edge("plan_questions", "ask_question")
+    graph.add_edge("plan_questions", "generate_question")
+    graph.add_edge("generate_question", "ask_question")
     graph.add_edge("ask_question", "assess_answer")
     graph.add_edge("ask_follow_up", "assess_answer")
     graph.add_conditional_edges(
@@ -71,11 +77,15 @@ def build_practice_graph():
         route_after_assessment,
         {
             "ask_follow_up": "ask_follow_up",
-            "ask_question": "advance_question",
-            "evaluate": "evaluate_practice",
+            "finalize_question": "finalize_question",
         },
     )
-    graph.add_edge("advance_question", "ask_question")
+    graph.add_conditional_edges(
+        "finalize_question",
+        route_after_final_assessment,
+        {"ask_question": "advance_question", "evaluate": "evaluate_practice"},
+    )
+    graph.add_edge("advance_question", "generate_question")
     graph.add_edge("evaluate_practice", END)
 
     return graph
@@ -95,11 +105,13 @@ def build_professional_graph():
     # Parallel preparation (resume + JD analysis concurrently)
     graph.add_node("parallel_analyze", parallel_analyze)
     graph.add_node("plan_questions_round1", plan_questions_with_resume)
+    graph.add_node("generate_question", generate_current_question)
 
     # Shared interview loop nodes (reused for both rounds)
     graph.add_node("ask_question", ask_question)
     graph.add_node("ask_follow_up", ask_follow_up)
     graph.add_node("assess_answer", assess_answer)
+    graph.add_node("finalize_question", finalize_question_assessment)
     graph.add_node("advance_question", advance_question)
 
     # Round transition
@@ -112,7 +124,8 @@ def build_professional_graph():
     # ── Edges ──
     graph.set_entry_point("parallel_analyze")
     graph.add_edge("parallel_analyze", "plan_questions_round1")
-    graph.add_edge("plan_questions_round1", "ask_question")
+    graph.add_edge("plan_questions_round1", "generate_question")
+    graph.add_edge("generate_question", "ask_question")
 
     # Interview loop (shared by both rounds)
     graph.add_edge("ask_question", "assess_answer")
@@ -122,16 +135,23 @@ def build_professional_graph():
         route_after_assessment,
         {
             "ask_follow_up": "ask_follow_up",
+            "finalize_question": "finalize_question",
+        },
+    )
+    graph.add_conditional_edges(
+        "finalize_question",
+        route_after_final_assessment,
+        {
             "ask_question": "advance_question",
             "summarize_round1": "summarize_round1",
             "evaluate": "evaluate_interview",
         },
     )
-    graph.add_edge("advance_question", "ask_question")
+    graph.add_edge("advance_question", "generate_question")
 
     # Round 1 → Round 2 transition
     graph.add_edge("summarize_round1", "plan_questions_round2")
-    graph.add_edge("plan_questions_round2", "ask_question")
+    graph.add_edge("plan_questions_round2", "generate_question")
 
     graph.add_edge("evaluate_interview", END)
 

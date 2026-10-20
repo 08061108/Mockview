@@ -19,6 +19,19 @@ ALGORITHM = "HS256"
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def validate_auth_configuration() -> None:
+    """Fail before serving requests; never include the rejected value in errors."""
+    secret = settings.auth_secret_key
+    lowered = secret.casefold()
+    weak_markers = ("change-me", "change_me", "replace-with", "your-secret", "dev-secret", "generate-a-random", "test-secret")
+    repeated = any(secret == secret[:size] * (len(secret) // size)
+                   for size in range(1, len(secret) // 2 + 1) if len(secret) % size == 0)
+    if len(secret.encode("utf-8")) < 32 or len(set(secret)) < 12 or repeated or secret.startswith("<") or any(
+        marker in lowered for marker in weak_markers
+    ):
+        raise RuntimeError("AUTH_SECRET_KEY must be a randomly generated secret of at least 32 bytes; placeholders are forbidden.")
+
+
 def normalize_username(username: str) -> str:
     return username.strip().lower()
 

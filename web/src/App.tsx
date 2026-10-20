@@ -13,6 +13,7 @@ import {
   LogOut,
   MessageSquareText,
   Play,
+  Pause,
   RotateCcw,
   Send,
   Sparkles,
@@ -26,12 +27,33 @@ import {
   checkHealth,
   exportInterviewReport,
   getInterviewReport,
+  getInterviewTranscript,
+  pauseInterview,
+  resumeInterview,
+  endInterview,
   getMe,
   listInterviewSessions,
   login,
   register,
   startInterview,
+  createPreparationCase,
+  uploadPreparationResume,
+  startPreparationAnalysis,
+  getPreparationProgress,
+  getRepracticeOptions,
+  continuePreparationOperation,
+  cancelPreparationOperation,
+  answerPreparationClarification,
+  createInterviewFromPreparation,
+  createRepracticeCase,
+  listMemoryObservations,
+  disputeMemoryObservation,
+  correctMemoryFact,
+  listKnowledgeCandidates,
+  reviewKnowledgeCandidate,
+  publishKnowledgeRelease,
   websocketUrl,
+  authenticateWebsocket,
 } from "./api";
 import type {
   ChatItem,
@@ -42,6 +64,13 @@ import type {
   ResumeParseResult,
   ServerMessage,
   UserPublic,
+  PreparationCase,
+  OperationRecord,
+  KnowledgeDocument,
+  KnowledgeRelease,
+  MemoryObservation,
+  PublicTranscript,
+  RepracticeOptions,
 } from "./types";
 
 const sampleJd = `岗位：AI 应用开发工程师
@@ -58,13 +87,15 @@ const sampleJd = `岗位：AI 应用开发工程师
 - 熟悉 REST API、WebSocket、数据库和基础部署流程；
 - 有 AI 应用项目经验，能解释架构设计、异常处理和效果评估方法。`;
 
-type View = "setup" | "history" | "interview" | "report";
+type View = "setup" | "preparation" | "observations" | "knowledge" | "history" | "interview" | "record" | "report";
 type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 type AuthMode = "login" | "register";
 
 const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const AUTH_TOKEN_KEY = "ai-mock-auth-token";
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000] as const;
+const RECONNECT_TOTAL_LIMIT_MS = 30_000;
+const STABLE_CONNECTION_MS = 15_000;
 
 function streamMessageMeta(payload: Extract<ServerMessage, { type: "stream_chunk" }>) {
   return payload.kind === "follow_up"
@@ -79,6 +110,14 @@ function normalizeMessageContent(content: string) {
 }
 
 function appendInterviewerMessage(items: ChatItem[], nextItem: ChatItem) {
+  if (nextItem.turnId) {
+    const index = items.findIndex((item) => item.turnId === nextItem.turnId);
+    if (index >= 0) {
+      return items.map((item, current) =>
+        current === index ? { ...item, ...nextItem, id: item.id } : item,
+      );
+    }
+  }
   const previous = items[items.length - 1];
   if (previous?.role !== "interviewer") return [...items, nextItem];
 
@@ -94,6 +133,25 @@ function appendInterviewerMessage(items: ChatItem[], nextItem: ChatItem) {
 
 const modeName = (mode: InterviewMode) =>
   mode === "professional" ? "专业面试模式" : "练习模式";
+
+const transcriptMessages = (data: PublicTranscript): ChatItem[] =>
+  data.items.map((item) => {
+    const review = item.question_id
+      ? data.question_reviews.find((value) => value.question_id === item.question_id)
+      : undefined;
+    return {
+      id: item.message_id,
+      turnId: item.turn_id ?? undefined,
+      role: item.role,
+      content: item.content,
+      meta:
+        item.processing_status === "failed_retryable"
+          ? "回答待显式重试"
+          : item.role === "interviewer" && review
+            ? `${review.primary_skill} · ${review.scorable && review.score ? `最终评分 ${review.score}/10` : "未评分"}`
+            : undefined,
+    };
+  });
 
 const difficultyName = (difficulty?: string) => {
   const map: Record<string, string> = {
@@ -115,12 +173,22 @@ const statusText = (stage: string, fallback: string) => {
     retrieving_questions: "正在从题库检索相关参考问题。",
     retrieval_complete: "题库检索完成。",
     planning_questions: "正在规划个性化面试问题。",
+    planning_blueprint: "正在冻结本轮考察目标和题目槽位。",
+    blueprint_ready: "考察蓝图已就绪，正在生成首题。",
+    generating_question: "正在生成并校验当前题目。",
+    question_ready: "当前题目已通过校验。",
+    question_failed: "当前题目生成失败，请选择重试或阶段性结束。",
     questions_planned: "个性化问题规划完成。",
     questions_ready: "问题已准备好，面试即将开始。",
     resumed: "已恢复到当前面试进度。",
     waiting: "正在等待下一轮问题。",
     processing: "正在处理面试流程，请稍候。",
+    preparing_interview: "正在准备材料分析、考察蓝图和首题。",
+    evaluating_answer: "正在评估回答并准备下一步。",
+    retrying: "正在重试失败的面试步骤。",
     evaluating: "正在结束面试并生成评估报告。",
+    pausing: "暂停请求已接受，正在完成当前操作。",
+    paused: "面试已暂停。",
     pong: "连接正常。",
   };
   return map[stage] ?? fallback;
@@ -141,6 +209,17 @@ export function App() {
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   const [resumeFile, setResumeFile] = useState<File | null>(null);
+  const [projectNotes, setProjectNotes] = useState("");
+  const [preparationCase, setPreparationCase] = useState<PreparationCase | null>(null);
+  const [preparationOperation, setPreparationOperation] = useState<OperationRecord | null>(null);
+  const [activePreparationId, setActivePreparationId] = useState("");
+  const [preparationRefresh, setPreparationRefresh] = useState(0);
+  const [repracticeOptions, setRepracticeOptions] = useState<RepracticeOptions | null>(null);
+  const [repracticeNotice, setRepracticeNotice] = useState("");
+  const [isPreparing, setIsPreparing] = useState(false);
+  const [knowledgeCandidates, setKnowledgeCandidates] = useState<KnowledgeDocument[]>([]);
+  const [knowledgeRelease, setKnowledgeRelease] = useState<KnowledgeRelease | null>(null);
+  const [observations, setObservations] = useState<MemoryObservation[]>([]);
   const [resume, setResume] = useState<ResumeParseResult | null>(null);
   const [sessionId, setSessionId] = useState("");
   const [historyItems, setHistoryItems] = useState<InterviewSessionSummary[]>([]);
@@ -164,8 +243,16 @@ export function App() {
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectEnabledRef = useRef(false);
+  const reconnectStartedAtRef = useRef<number | null>(null);
+  const stableConnectionTimerRef = useRef<number | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const lastEventSequenceRef = useRef(0);
+  const pendingAnswerRef = useRef<{
+    answerId: string;
+    turnId: string;
+    content: string;
+    socket: WebSocket | null;
+  } | null>(null);
 
   useEffect(() => {
     checkHealth().then(setHealth).catch(() => setHealth(null));
@@ -216,6 +303,225 @@ export function App() {
   }, []);
 
   const canStart = Boolean(currentUser && authToken && jdText.trim().length >= 10 && !isStarting);
+  const canPrepare = Boolean(currentUser && authToken && jdText.trim().length >= 10 && !isPreparing);
+
+  function selectPreparation(next: PreparationCase) {
+    if (!currentUser) return;
+    localStorage.setItem(`mockview:preparation:${currentUser.id}`, JSON.stringify({caseId: next.case_id, mode, maxFollowUps}));
+    setActivePreparationId(next.case_id);
+    setPreparationCase(next);
+    setPreparationOperation(null);
+    setPreparationRefresh((value) => value + 1);
+    setView("preparation");
+  }
+
+  useEffect(() => {
+    setPreparationCase(null);
+    setPreparationOperation(null);
+    const saved = currentUser ? localStorage.getItem(`mockview:preparation:${currentUser.id}`) ?? "" : "";
+    let caseId = saved;
+    if (saved.startsWith("{")) {
+      try {
+        const pointer = JSON.parse(saved);
+        caseId = typeof pointer.caseId === "string" ? pointer.caseId : "";
+        if (["practice", "professional"].includes(pointer.mode)) setMode(pointer.mode);
+        if (Number.isInteger(pointer.maxFollowUps) && pointer.maxFollowUps >= 0 && pointer.maxFollowUps <= 5) setMaxFollowUps(pointer.maxFollowUps);
+      } catch { caseId = ""; }
+    }
+    setActivePreparationId(caseId);
+    if (caseId) setView("preparation");
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (!activePreparationId || !authToken || !currentUser) return;
+    let active = true;
+    let timer: number | undefined;
+    async function refresh() {
+      try {
+        const progress = await getPreparationProgress(authToken, activePreparationId);
+        if (!active) return;
+        setPreparationCase(progress.case);
+        setPreparationOperation(progress.operation);
+        if (progress.operation && ["accepted", "running"].includes(progress.operation.status)) {
+          timer = window.setTimeout(refresh, 2000);
+        }
+      } catch (err) {
+        if (active) setError(err instanceof Error ? err.message : "恢复准备任务失败，请刷新重试。");
+      }
+    }
+    void refresh();
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [activePreparationId, authToken, currentUser?.id, preparationRefresh]);
+
+  useEffect(() => {
+    let active = true;
+    setRepracticeOptions(null);
+    setRepracticeNotice("");
+    if (report && sessionId && authToken) {
+      getRepracticeOptions(authToken, sessionId).then((options) => {
+        if (active) {
+          setRepracticeOptions(options);
+          if (!options.weak_skills.length) setRepracticeNotice("本次没有可用于复练的有效薄弱技能（最终技能分低于 8 分）。");
+        }
+      }).catch((err) => {
+        if (active) setRepracticeNotice(err instanceof Error ? err.message : "无法加载复练来源。");
+      });
+    }
+    return () => { active = false; };
+  }, [report, sessionId, authToken]);
+
+  function refreshPreparation() {
+    setPreparationRefresh((value) => value + 1);
+  }
+
+  async function handlePrepare() {
+    if (!canPrepare) return;
+    setIsPreparing(true);
+    setError("");
+    try {
+      const nextCase = await createPreparationCase(authToken, {
+        jdText: jdText.trim(),
+        projectNotes: projectNotes.trim(),
+      });
+      selectPreparation(nextCase);
+      const materialCase = resumeFile
+        ? await uploadPreparationResume(authToken, nextCase.case_id, resumeFile)
+        : nextCase;
+      setPreparationCase(materialCase);
+      await startPreparationAnalysis(authToken, materialCase.case_id);
+      refreshPreparation();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "准备任务创建失败。");
+    } finally {
+      setIsPreparing(false);
+    }
+  }
+
+  async function handleStartPrepared() {
+    if (!preparationCase || isStarting) return;
+    setIsStarting(true);
+    setError("");
+    try {
+      if (currentUser) localStorage.setItem(`mockview:preparation:${currentUser.id}`,
+        JSON.stringify({caseId: preparationCase.case_id, mode, maxFollowUps}));
+      const response = await createInterviewFromPreparation(authToken, preparationCase.case_id, {
+        mode,
+        maxFollowUps,
+      });
+      lastEventSequenceRef.current = 0;
+      pendingAnswerRef.current = null;
+      setReport(null);
+      setCurrentTurn(null);
+      setAnswer("");
+      setIsAwaitingAnswer(false);
+      setMode(response.mode);
+      setSessionId(response.session_id);
+      setMessages([{ id: uid(), role: "system", content: "已按考察目标创建面试，正在准备第一题。" }]);
+      setView("interview");
+      connectSocket(response.session_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "创建目标面试失败。");
+    } finally {
+      setIsStarting(false);
+    }
+  }
+
+  async function handleClarification(clarificationId: string, answer: string) {
+    if (!preparationCase || !answer.trim()) return;
+    try {
+    const updatedCase = await answerPreparationClarification(
+      authToken,
+      preparationCase.case_id,
+      clarificationId,
+      answer.trim(),
+    );
+    setPreparationCase(updatedCase);
+    const allAnswered = updatedCase.clarifications.every(
+      (item) => item.status !== "pending",
+    );
+    if (allAnswered && preparationOperation?.status === "waiting_input") {
+      const continued = await continuePreparationOperation(
+        authToken,
+        preparationOperation.operation_id,
+      );
+      setPreparationOperation(continued);
+      refreshPreparation();
+    }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "提交补充失败，请重试。");
+    }
+  }
+
+  async function handleContinuePreparation() {
+    if (!preparationCase) return;
+    try {
+      if (preparationOperation) await continuePreparationOperation(authToken, preparationOperation.operation_id);
+      else await startPreparationAnalysis(authToken, preparationCase.case_id);
+      refreshPreparation();
+    } catch (err) { setError(err instanceof Error ? err.message : "继续分析失败。"); }
+  }
+
+  async function handleCancelPreparation() {
+    if (!preparationOperation) return;
+    try {
+      await cancelPreparationOperation(authToken, preparationOperation.operation_id);
+      refreshPreparation();
+    } catch (err) { setError(err instanceof Error ? err.message : "取消失败。"); }
+  }
+
+  async function openObservationsView() {
+    setView("observations");
+    setError("");
+    try {
+      setObservations(await listMemoryObservations(authToken));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载能力观察失败。");
+    }
+  }
+
+  async function handleDisputeObservation(observationId: string) {
+    await disputeMemoryObservation(authToken, observationId);
+    setObservations(await listMemoryObservations(authToken));
+  }
+
+  async function handleCorrectObservation(observationId: string, content: string) {
+    await correctMemoryFact(authToken, content, observationId);
+    setObservations(await listMemoryObservations(authToken));
+  }
+
+  async function handleRepractice(selectedSkills: string[]) {
+    if (!repracticeOptions || !selectedSkills.length || isPreparing) return;
+    setIsPreparing(true);
+    setError("");
+    try {
+      const next = await createRepracticeCase(authToken, repracticeOptions.case_id,
+        selectedSkills, repracticeOptions.source_session_id);
+      selectPreparation(next);
+      await startPreparationAnalysis(authToken, next.case_id);
+      refreshPreparation();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "创建复练任务失败。");
+    } finally { setIsPreparing(false); }
+  }
+
+  async function openKnowledgeView() {
+    setView("knowledge");
+    setError("");
+    try {
+      setKnowledgeCandidates(await listKnowledgeCandidates(authToken));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载知识候选失败。");
+    }
+  }
+
+  async function handleKnowledgeReview(documentId: string, nextStatus: "approved" | "rejected") {
+    await reviewKnowledgeCandidate(authToken, documentId, nextStatus);
+    setKnowledgeCandidates(await listKnowledgeCandidates(authToken));
+  }
+
+  async function handleKnowledgePublish() {
+    setKnowledgeRelease(await publishKnowledgeRelease(authToken));
+  }
 
   async function loadHistory() {
     if (!authToken) return;
@@ -262,10 +568,25 @@ export function App() {
     }
   }
 
+  function clearStableConnectionTimer() {
+    if (stableConnectionTimerRef.current !== null) {
+      window.clearTimeout(stableConnectionTimerRef.current);
+      stableConnectionTimerRef.current = null;
+    }
+  }
+
+  function markBusinessProgress() {
+    reconnectAttemptsRef.current = 0;
+    reconnectStartedAtRef.current = null;
+    clearStableConnectionTimer();
+  }
+
   function disableAutoReconnect() {
     reconnectEnabledRef.current = false;
     reconnectAttemptsRef.current = 0;
+    reconnectStartedAtRef.current = null;
     clearReconnectTimer();
+    clearStableConnectionTimer();
   }
 
   function closeSocket() {
@@ -300,6 +621,8 @@ export function App() {
         token: authToken,
         resumeFile,
       });
+      lastEventSequenceRef.current = 0;
+      pendingAnswerRef.current = null;
       setSessionId(response.session_id);
       lastEventSequenceRef.current = 0;
       setResume(response.resume ?? null);
@@ -328,11 +651,15 @@ export function App() {
     if (
       !reconnectEnabledRef.current ||
       reconnectTimerRef.current !== null ||
-      reconnectAttemptsRef.current >= RECONNECT_DELAYS_MS.length
+      reconnectAttemptsRef.current >= RECONNECT_DELAYS_MS.length ||
+      (reconnectStartedAtRef.current !== null &&
+        Date.now() - reconnectStartedAtRef.current >= RECONNECT_TOTAL_LIMIT_MS)
     ) {
       if (
         reconnectEnabledRef.current &&
-        reconnectAttemptsRef.current >= RECONNECT_DELAYS_MS.length
+        (reconnectAttemptsRef.current >= RECONNECT_DELAYS_MS.length ||
+          (reconnectStartedAtRef.current !== null &&
+            Date.now() - reconnectStartedAtRef.current >= RECONNECT_TOTAL_LIMIT_MS))
       ) {
         setConnection("error");
         setStatus("自动重连失败，请点击“重连”继续当前面试。");
@@ -341,6 +668,9 @@ export function App() {
     }
 
     const attempt = reconnectAttemptsRef.current;
+    if (reconnectStartedAtRef.current === null) {
+      reconnectStartedAtRef.current = Date.now();
+    }
     const delay = RECONNECT_DELAYS_MS[attempt];
     reconnectAttemptsRef.current += 1;
 
@@ -361,6 +691,7 @@ export function App() {
 
     if (options.resetAttempts) {
       reconnectAttemptsRef.current = 0;
+      reconnectStartedAtRef.current = null;
     }
 
     reconnectEnabledRef.current = true;
@@ -372,15 +703,21 @@ export function App() {
     }
     setConnection("connecting");
     setStatus("正在连接实时面试通道。");
-    const ws = new WebSocket(websocketUrl(id, authToken));
+    const ws = new WebSocket(websocketUrl(id, lastEventSequenceRef.current));
     socketRef.current = ws;
 
     ws.onopen = () => {
       if (socketRef.current !== ws) return;
-      reconnectAttemptsRef.current = 0;
+      authenticateWebsocket(ws, authToken);
       setError("");
       setConnection("open");
       setStatus("连接成功，面试官正在准备第一轮问题。");
+      clearStableConnectionTimer();
+      stableConnectionTimerRef.current = window.setTimeout(() => {
+        if (socketRef.current === ws && ws.readyState === WebSocket.OPEN) {
+          markBusinessProgress();
+        }
+      }, STABLE_CONNECTION_MS);
     };
 
     ws.onmessage = (event) => {
@@ -395,11 +732,17 @@ export function App() {
       setError("WebSocket 连接异常，请稍后重连或检查后端服务。");
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (socketRef.current !== ws) return;
 
       socketRef.current = null;
+      clearStableConnectionTimer();
       setConnection((prev) => (prev === "error" ? "error" : "closed"));
+      if (event.code === 4401 || event.code === 4403) {
+        reconnectEnabledRef.current = false;
+        setError("登录已失效或无权访问此会话，请重新登录后连接。");
+        return;
+      }
       scheduleReconnect(id);
     };
   }
@@ -413,16 +756,34 @@ export function App() {
   async function openHistoricalReport(item: InterviewSessionSummary) {
     setError("");
     try {
-      const data = await getInterviewReport(authToken, item.session_id);
+      const [data, transcript] = await Promise.all([
+        getInterviewReport(authToken, item.session_id),
+        getInterviewTranscript(authToken, item.session_id),
+      ]);
       closeSocket();
       setSessionId(item.session_id);
       setMode(item.mode);
-      setMessages([]);
+      setMessages(transcriptMessages(transcript));
       setReport(data);
       setConnection("idle");
       setView("report");
     } catch (err) {
       setHistoryError(err instanceof Error ? err.message : "加载报告失败。");
+    }
+  }
+
+  async function openHistoricalRecord(item: InterviewSessionSummary) {
+    setHistoryError("");
+    try {
+      const transcript = await getInterviewTranscript(authToken, item.session_id);
+      closeSocket();
+      setSessionId(item.session_id);
+      setMode(item.mode);
+      setMessages(transcriptMessages(transcript));
+      setReport(transcript.report ?? null);
+      setView("record");
+    } catch (err) {
+      setHistoryError(err instanceof Error ? err.message : "加载面试记录失败。");
     }
   }
 
@@ -443,19 +804,13 @@ export function App() {
     }
   }
 
-  function resumeHistoricalInterview(item: InterviewSessionSummary) {
+  async function resumeHistoricalInterview(item: InterviewSessionSummary) {
     closeSocket();
     setSessionId(item.session_id);
     lastEventSequenceRef.current = 0;
     setMode(item.mode);
     setResume(null);
-    setMessages([
-      {
-        id: uid(),
-        role: "system",
-        content: "正在恢复历史面试，会从后端 checkpoint 读取当前进度。",
-      },
-    ]);
+    setMessages([]);
     setCurrentTurn(null);
     setAnswer("");
     setReport(null);
@@ -463,7 +818,14 @@ export function App() {
     setStatus("正在恢复历史面试。");
     setStage("resuming");
     setView("interview");
-    connectSocket(item.session_id);
+    try {
+      if (item.status === "paused" || item.status === "pausing") {
+        await resumeInterview(authToken, item.session_id);
+      }
+      connectSocket(item.session_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "恢复面试失败。");
+    }
   }
 
   function handleServerMessage(payload: ServerMessage) {
@@ -475,13 +837,51 @@ export function App() {
       lastEventSequenceRef.current = sequence;
     }
 
+    if (payload.type === "transcript_snapshot") {
+      setMessages(transcriptMessages(payload.data));
+      if (payload.data.report) setReport(payload.data.report);
+      if (payload.data.session.pending_action === "answer_retry_required") {
+        setError("上次提交的回答未能确认完成，请点击“重试失败步骤”显式重试。");
+        setStage("retry_required");
+        setIsAwaitingAnswer(false);
+      }
+      if (payload.data.session.status === "paused" || payload.data.session.status === "pausing") {
+        setStage(payload.data.session.status);
+        setIsAwaitingAnswer(false);
+      }
+      return;
+    }
+
     if (payload.type === "status") {
+      if (payload.sequence != null) markBusinessProgress();
       setStage(payload.stage);
       setStatus(statusText(payload.stage, payload.message));
       return;
     }
 
+    const reconcilePendingAnswer = (turnId: string) => {
+      const pending = pendingAnswerRef.current;
+      if (!pending) return;
+      if (pending.turnId !== turnId) {
+        pendingAnswerRef.current = null;
+        return;
+      }
+      const socket = socketRef.current;
+      if (socket && socket.readyState === WebSocket.OPEN && pending.socket !== socket) {
+        socket.send(JSON.stringify({
+          type: "answer",
+          content: pending.content,
+          answer_id: pending.answerId,
+          turn_id: pending.turnId,
+        }));
+        pending.socket = socket;
+        setIsAwaitingAnswer(false);
+        setStatus("正在确认断线前提交的回答。");
+      }
+    };
+
     if (payload.type === "stream_chunk") {
+      markBusinessProgress();
       const streamMeta = streamMessageMeta(payload);
 
       if (payload.event === "start") {
@@ -493,6 +893,8 @@ export function App() {
           skillTags: payload.skill_tags,
           difficulty: payload.difficulty,
           followUpNumber: payload.follow_up_number ?? undefined,
+          questionId: payload.question_id,
+          turnId: payload.turn_id,
         });
         setStatus(
           payload.kind === "follow_up"
@@ -500,11 +902,11 @@ export function App() {
             : "正在生成面试问题，请稍候。",
         );
         setMessages((items) => {
-          const existing = items.some((item) => item.id === payload.stream_id);
+          const existing = items.some((item) => item.turnId === payload.turn_id);
           if (existing) {
             return items.map((item) =>
-              item.id === payload.stream_id
-                ? { ...item, streaming: true, meta: streamMeta }
+              item.turnId === payload.turn_id
+                ? { ...item, streamId: payload.stream_id, streaming: true, meta: streamMeta }
                 : item,
             );
           }
@@ -512,6 +914,8 @@ export function App() {
             ...items,
             {
               id: payload.stream_id,
+              turnId: payload.turn_id,
+              streamId: payload.stream_id,
               role: "interviewer",
               content: "",
               streaming: true,
@@ -524,11 +928,18 @@ export function App() {
 
       if (payload.event === "delta") {
         setMessages((items) => {
-          const existing = items.some((item) => item.id === payload.stream_id);
+          const existing = items.some((item) => item.turnId === payload.turn_id);
           if (existing) {
             return items.map((item) =>
-              item.id === payload.stream_id
-                ? { ...item, content: item.content + payload.chunk }
+              item.turnId === payload.turn_id
+                ? {
+                    ...item,
+                    content:
+                      item.streamId === payload.stream_id
+                        ? item.content + payload.chunk
+                        : payload.chunk,
+                    streamId: payload.stream_id,
+                  }
                 : item,
             );
           }
@@ -536,6 +947,8 @@ export function App() {
             ...items,
             {
               id: payload.stream_id,
+              turnId: payload.turn_id,
+              streamId: payload.stream_id,
               role: "interviewer",
               content: payload.chunk,
               streaming: true,
@@ -554,13 +967,14 @@ export function App() {
           : "问题已生成，请作答。",
       );
       setMessages((items) => {
-        const existing = items.some((item) => item.id === payload.stream_id);
+        const existing = items.some((item) => item.turnId === payload.turn_id);
         if (existing) {
           return items.map((item) =>
-            item.id === payload.stream_id
+            item.turnId === payload.turn_id
               ? {
                   ...item,
                   content: payload.content || item.content,
+                  streamId: payload.stream_id,
                   streaming: false,
                   meta: streamMeta,
                 }
@@ -571,6 +985,8 @@ export function App() {
           ...items,
           {
             id: payload.stream_id,
+            turnId: payload.turn_id,
+            streamId: payload.stream_id,
             role: "interviewer",
             content: payload.content,
             streaming: false,
@@ -578,10 +994,12 @@ export function App() {
           },
         ];
       });
+      reconcilePendingAnswer(payload.turn_id);
       return;
     }
 
     if (payload.type === "question") {
+      markBusinessProgress();
       setIsAwaitingAnswer(true);
       setStage("awaiting_answer");
       setCurrentTurn({
@@ -589,11 +1007,14 @@ export function App() {
         totalQuestions: payload.total_questions,
         skillTags: payload.skill_tags,
         difficulty: payload.difficulty,
+        questionId: payload.question_id,
+        turnId: payload.turn_id,
       });
       setStatus("请作答当前问题。");
       setMessages((items) =>
         appendInterviewerMessage(items, {
-          id: uid(),
+          id: payload.turn_id || uid(),
+          turnId: payload.turn_id,
           role: "interviewer",
           content: payload.content,
           streaming: false,
@@ -602,30 +1023,37 @@ export function App() {
           )}`,
         }),
       );
+      reconcilePendingAnswer(payload.turn_id);
       return;
     }
 
     if (payload.type === "follow_up") {
+      markBusinessProgress();
       setIsAwaitingAnswer(true);
       setStage("awaiting_answer");
       setCurrentTurn({
         questionIndex: payload.question_index,
         followUpNumber: payload.follow_up_number,
+        questionId: payload.question_id,
+        turnId: payload.turn_id,
       });
       setStatus("面试官正在追问，请继续补充回答。");
       setMessages((items) =>
         appendInterviewerMessage(items, {
-          id: uid(),
+          id: payload.turn_id || uid(),
+          turnId: payload.turn_id,
           role: "interviewer",
           content: payload.content,
           streaming: false,
           meta: `第 ${payload.question_index} 题追问 · 第 ${payload.follow_up_number} 次`,
         }),
       );
+      reconcilePendingAnswer(payload.turn_id);
       return;
     }
 
     if (payload.type === "interview_end") {
+      markBusinessProgress();
       setIsAwaitingAnswer(false);
       setStatus("面试已结束，正在整理评估报告。");
       setStage("evaluating");
@@ -633,6 +1061,7 @@ export function App() {
     }
 
     if (payload.type === "report") {
+      pendingAnswerRef.current = null;
       disableAutoReconnect();
       setReport(payload.data);
       setStatus("报告已生成。");
@@ -652,13 +1081,26 @@ export function App() {
     event.preventDefault();
     const content = answer.trim();
     if (!content || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+    const turnId = currentTurn?.turnId;
+    if (!turnId) {
+      setError("当前回合标识尚未就绪，请等待问题完整显示后再提交。");
+      return;
+    }
+    const answerId = uid();
     socketRef.current.send(
       JSON.stringify({
         type: "answer",
         content,
-        answer_id: uid(),
+        answer_id: answerId,
+        turn_id: turnId,
       }),
     );
+    pendingAnswerRef.current = {
+      answerId,
+      turnId,
+      content,
+      socket: socketRef.current,
+    };
     setMessages((items) => [...items, { id: uid(), role: "candidate", content }]);
     setAnswer("");
     setIsAwaitingAnswer(false);
@@ -666,12 +1108,54 @@ export function App() {
     setStage("processing");
   }
 
-  function stopInterview() {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: "stop" }));
-      setStatus("正在提前结束面试并生成阶段性报告。");
+  async function pauseCurrentInterview() {
+    try {
+      await pauseInterview(authToken, sessionId);
+      setStage("pausing");
+      setStatus("暂停请求已接受；当前评分完成后会进入暂停状态。");
       setIsAwaitingAnswer(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "暂停面试失败。");
     }
+  }
+
+  async function resumeCurrentInterview() {
+    try {
+      await resumeInterview(authToken, sessionId);
+      setStage("resuming");
+      setStatus("正在恢复面试。");
+      connectSocket(sessionId, { resetAttempts: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "恢复面试失败。");
+    }
+  }
+
+  async function stopInterview() {
+    if (!window.confirm("确定提前结束本次面试吗？已接受的回答会保留。")) return;
+    setStatus("正在提前结束面试并生成阶段性报告。");
+    setIsAwaitingAnswer(false);
+    try {
+      await endInterview(authToken, sessionId);
+      const transcript = await getInterviewTranscript(authToken, sessionId);
+      setMessages(transcriptMessages(transcript));
+      setReport(transcript.report ?? null);
+      setStage("completed");
+      setView(transcript.has_report ? "report" : "record");
+      closeSocket();
+      void loadHistory();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "结束面试失败。");
+    }
+  }
+
+  function retryCurrentOperation() {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "retry", retry_id: uid() }));
+    setError("");
+    setIsAwaitingAnswer(false);
+    setStage("retrying");
+    setStatus("已提交显式重试，正在恢复失败的出题步骤。");
   }
 
   function resetAll() {
@@ -687,6 +1171,7 @@ export function App() {
     setReport(null);
     setResume(null);
     setConnection("idle");
+    pendingAnswerRef.current = null;
   }
 
   const progress = useMemo(() => {
@@ -744,6 +1229,22 @@ export function App() {
             <History size={15} />
             历史记录
           </button>
+          <button className={view === "observations" ? "active" : ""} onClick={openObservationsView} type="button">
+            <ClipboardList size={15} />
+            能力观察
+          </button>
+          {preparationCase && (
+            <button className={view === "preparation" ? "active" : ""} onClick={() => setView("preparation")} type="button">
+              <ClipboardList size={15} />
+              准备任务
+            </button>
+          )}
+          {currentUser.role === "admin" && (
+            <button className={view === "knowledge" ? "active" : ""} onClick={openKnowledgeView} type="button">
+              <FileText size={15} />
+              知识审核
+            </button>
+          )}
         </nav>
       )}
 
@@ -776,9 +1277,49 @@ export function App() {
           resumeFile={resumeFile}
           setResumeFile={setResumeFile}
           isStarting={isStarting}
+          isPreparing={isPreparing}
           canStart={canStart}
+          canPrepare={canPrepare}
+          projectNotes={projectNotes}
+          setProjectNotes={setProjectNotes}
           error={error}
           onStart={handleStart}
+          onPrepare={handlePrepare}
+        />
+      )}
+
+      {currentUser && view === "preparation" && preparationCase && (
+        <PreparationPage
+          preparationCase={preparationCase}
+          operation={preparationOperation}
+          error={error}
+          isStarting={isStarting}
+          onRefresh={() => void refreshPreparation()}
+          onStart={handleStartPrepared}
+          onClarify={handleClarification}
+          onContinue={handleContinuePreparation}
+          onCancel={handleCancelPreparation}
+          onBack={() => setView("setup")}
+        />
+      )}
+
+      {currentUser && view === "observations" && (
+        <ObservationsPage
+          items={observations}
+          error={error}
+          onRefresh={openObservationsView}
+          onDispute={handleDisputeObservation}
+          onCorrect={handleCorrectObservation}
+        />
+      )}
+
+      {currentUser && view === "knowledge" && (
+        <KnowledgePage
+          documents={knowledgeCandidates}
+          release={knowledgeRelease}
+          error={error}
+          onReview={handleKnowledgeReview}
+          onPublish={handleKnowledgePublish}
         />
       )}
 
@@ -800,6 +1341,9 @@ export function App() {
           transcriptRef={transcriptRef}
           onSubmitAnswer={submitAnswer}
           onStop={stopInterview}
+          onPause={pauseCurrentInterview}
+          onResume={resumeCurrentInterview}
+          onRetry={retryCurrentOperation}
           onReconnect={() => connectSocket(sessionId, { resetAttempts: true })}
           onBack={() => {
             closeSocket();
@@ -815,8 +1359,19 @@ export function App() {
           error={historyError}
           onRefresh={loadHistory}
           onViewReport={openHistoricalReport}
+          onViewRecord={openHistoricalRecord}
           onResume={resumeHistoricalInterview}
           onExport={downloadReport}
+        />
+      )}
+
+      {currentUser && view === "record" && (
+        <TranscriptRecordPage
+          sessionId={sessionId}
+          messages={messages}
+          report={report}
+          onBack={() => setView("history")}
+          onViewReport={() => setView("report")}
         />
       )}
 
@@ -829,6 +1384,11 @@ export function App() {
           onRestart={resetAll}
           onBackToInterview={() => setView("interview")}
           onExport={downloadReport}
+          onRepractice={repracticeOptions?.weak_skills.length ? handleRepractice : undefined}
+          weakSkills={repracticeOptions?.weak_skills ?? []}
+          repracticeNotice={repracticeNotice}
+          isPreparing={isPreparing}
+          error={error}
         />
       )}
     </main>
@@ -958,9 +1518,14 @@ function SetupPage(props: {
   resumeFile: File | null;
   setResumeFile: (file: File | null) => void;
   isStarting: boolean;
+  isPreparing: boolean;
   canStart: boolean;
+  canPrepare: boolean;
+  projectNotes: string;
+  setProjectNotes: (value: string) => void;
   error: string;
   onStart: () => void;
+  onPrepare: () => void;
 }) {
   return (
     <section className="setup-layout">
@@ -1046,6 +1611,16 @@ function SetupPage(props: {
           <span>{props.resumeFile ? props.resumeFile.name : "上传简历，可选 PDF / PNG / JPG"}</span>
         </label>
 
+        <label className="field">
+          <span>项目补充说明（可选）</span>
+          <textarea
+            value={props.projectNotes}
+            onChange={(event) => props.setProjectNotes(event.target.value)}
+            rows={4}
+            placeholder="补充你在项目中的具体职责、设计取舍或希望重点验证的能力。"
+          />
+        </label>
+
         {props.error && (
           <div className="error-callout">
             <AlertCircle size={16} />
@@ -1053,11 +1628,218 @@ function SetupPage(props: {
           </div>
         )}
 
-        <button className="primary-action" disabled={!props.canStart} onClick={props.onStart}>
+        <button className="primary-action" disabled={!props.canPrepare} onClick={props.onPrepare}>
+          {props.isPreparing ? <Loader2 className="spin" size={18} /> : <ClipboardList size={18} />}
+          {props.isPreparing ? "正在分析材料与证据" : "分析证据并准备面试"}
+        </button>
+
+        <button className="secondary-button" disabled={!props.canStart} onClick={props.onStart}>
           {props.isStarting ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-          {props.isStarting ? "正在启动" : "开始模拟面试"}
+          {props.isStarting ? "正在启动" : "兼容快速模式（跳过证据准备）"}
         </button>
       </div>
+    </section>
+  );
+}
+
+function PreparationPage(props: {
+  preparationCase: PreparationCase;
+  operation: OperationRecord | null;
+  error: string;
+  isStarting: boolean;
+  onRefresh: () => void;
+  onStart: () => void;
+  onClarify: (clarificationId: string, answer: string) => void;
+  onContinue: () => void;
+  onCancel: () => void;
+  onBack: () => void;
+}) {
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const pendingClarifications = props.preparationCase.clarifications.filter(
+    (item) => item.status === "pending",
+  );
+  const rawCoverage = props.operation?.result?.evidence_coverage;
+  const evidenceCoverage = rawCoverage && typeof rawCoverage === "object"
+    ? rawCoverage as {
+        eligible_target_count?: number;
+        unresolved_target_count?: number;
+      }
+    : null;
+  const ready = props.preparationCase.status === "ready" &&
+    props.operation?.status === "succeeded" &&
+    pendingClarifications.length === 0 &&
+    (evidenceCoverage?.eligible_target_count ?? 0) > 0;
+  return (
+    <section className="report-layout">
+      <div className="report-hero">
+        <button className="ghost-button" onClick={props.onBack}>
+          <ArrowLeft size={16} /> 返回设置
+        </button>
+        <div>
+          <span className="eyebrow">岗位准备任务</span>
+          <h1>考察目标与材料状态</h1>
+          <p>
+            材料版本 {props.preparationCase.material_revision} · 任务状态 {props.preparationCase.status}
+            {props.operation ? ` · 执行 ${props.operation.status}` : ""}
+          </p>
+        </div>
+        <div className="report-actions">
+          <button className="secondary-button" onClick={props.onRefresh}>
+            <RotateCcw size={16} /> 刷新进度
+          </button>
+          {!props.operation || ["failed_retryable", "waiting_input"].includes(props.operation.status) ? (
+            <button className="secondary-button" disabled={pendingClarifications.length > 0} onClick={props.onContinue}>
+              <Play size={16} /> 继续分析
+            </button>
+          ) : null}
+          {props.operation && ["accepted", "running", "waiting_input", "failed_retryable"].includes(props.operation.status) ? (
+            <button className="secondary-button" onClick={props.onCancel}>
+              <CircleStop size={16} /> 取消任务
+            </button>
+          ) : null}
+          <button className="primary-small" disabled={!ready || props.isStarting} onClick={props.onStart}>
+            {props.isStarting ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+            按目标开始面试
+          </button>
+        </div>
+      </div>
+
+      {props.error && <div className="error-callout"><AlertCircle size={16} />{props.error}</div>}
+      {props.operation && ["failed", "cancelled"].includes(props.operation.status) && <p>本次分析已结束，预算不会自动重置。请返回准备页修订材料后创建新的准备任务。</p>}
+      {props.operation?.error && <div className="error-callout"><AlertCircle size={16} />{props.operation.error}</div>}
+      {evidenceCoverage ? (
+        <div className="signal-strip">
+          可出题目标 {evidenceCoverage.eligible_target_count ?? 0} 个 ·
+          证据未解决目标 {evidenceCoverage.unresolved_target_count ?? 0} 个
+        </div>
+      ) : null}
+      {props.preparationCase.resume_parse_warnings.length ? (
+        <div className="error-callout">
+          <AlertCircle size={16} />
+          简历解析提示：{props.preparationCase.resume_parse_warnings.join("；")}
+        </div>
+      ) : null}
+
+      <div className="report-grid">
+        <section className="report-section span-2">
+          <h2>具体考察目标</h2>
+          <div className="highlight-list">
+            {props.preparationCase.targets.map((target) => (
+              <article key={target.target_id}>
+                <strong>{target.scope} · 权重 {(target.importance * 100).toFixed(0)}%</strong>
+                <p>{target.verification_goal}</p>
+                <small>来源：{target.sources.join(" / ")} · {target.status}</small>
+              </article>
+            ))}
+            {!props.preparationCase.targets.length && <p>正在分析材料并形成考察目标。</p>}
+          </div>
+        </section>
+
+        <section className="report-section span-2">
+          <h2>待补充材料</h2>
+          {pendingClarifications.length ? (
+            <div className="highlight-list">
+              {pendingClarifications.map((item) => (
+                <article key={item.clarification_id}>
+                  <strong>{item.question}</strong>
+                  <textarea
+                    rows={3}
+                    value={answers[item.clarification_id] ?? ""}
+                    onChange={(event) => setAnswers((current) => ({ ...current, [item.clarification_id]: event.target.value }))}
+                    placeholder="补充可核验的项目事实或说明"
+                  />
+                  <button
+                    className="primary-small"
+                    disabled={!(answers[item.clarification_id] ?? "").trim()}
+                    onClick={() => props.onClarify(item.clarification_id, answers[item.clarification_id] ?? "")}
+                  >
+                    提交补充
+                  </button>
+                </article>
+              ))}
+            </div>
+          ) : <p>当前没有必须补充的材料；系统会对未确认经历保持保守判断。</p>}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function ObservationsPage(props: {
+  items: MemoryObservation[];
+  error: string;
+  onRefresh: () => void;
+  onDispute: (observationId: string) => void;
+  onCorrect: (observationId: string, content: string) => Promise<void>;
+}) {
+  const [corrections, setCorrections] = useState<Record<string, string>>({});
+  return (
+    <section className="history-layout">
+      <div className="history-header">
+        <div>
+          <span className="eyebrow">长期记忆</span>
+          <h1>能力观察与评价依据</h1>
+          <p>这里只展示最终单题观察；提出异议后，该观察会从自动复练依据中排除并重算画像。</p>
+        </div>
+        <button className="secondary-button" onClick={props.onRefresh} type="button">
+          <RotateCcw size={16} /> 刷新
+        </button>
+      </div>
+      {props.error && <div className="error-callout"><AlertCircle size={16} />{props.error}</div>}
+      {!props.items.length ? (
+        <div className="empty-state"><ClipboardList size={18} />完成面试后会在这里形成可追溯的能力观察。</div>
+      ) : (
+        <div className="history-list">
+          {props.items.map((item) => {
+            const validity = String(item.structured?.validity ?? "valid");
+            return (
+              <article className="history-card" key={item.id}>
+                <div>
+                  <strong>{item.tags.join(" · ") || "面试观察"}</strong>
+                  <p>{item.content}</p>
+                  <small>来源：{item.source} · {new Date(item.created_at).toLocaleString()}</small>
+                </div>
+                <button
+                  className="secondary-button"
+                  disabled={validity !== "valid"}
+                  onClick={() => props.onDispute(item.id)}
+                  type="button"
+                >
+                  {validity === "disputed"
+                    ? "已提出异议"
+                    : validity === "replaced"
+                      ? "已被事实修正替代"
+                      : "对评价提出异议"}
+                </button>
+                {validity === "valid" && <div className="field">
+                  <label htmlFor={`correction-${item.id}`}>修正相关事实</label>
+                  <textarea
+                    id={`correction-${item.id}`}
+                    value={corrections[item.id] ?? ""}
+                    onChange={(event) => setCorrections((current) => ({
+                      ...current,
+                      [item.id]: event.target.value,
+                    }))}
+                    placeholder="填写经你确认的事实；原记录会保留替代关系"
+                  />
+                  <button
+                    className="primary-small"
+                    disabled={!(corrections[item.id] ?? "").trim()}
+                    onClick={async () => {
+                      await props.onCorrect(item.id, corrections[item.id] ?? "");
+                      setCorrections((current) => ({ ...current, [item.id]: "" }));
+                    }}
+                    type="button"
+                  >
+                    保存修正
+                  </button>
+                </div>}
+              </article>
+            );
+          })}
+        </div>
+      )}
+
     </section>
   );
 }
@@ -1068,6 +1850,7 @@ function HistoryPage(props: {
   error: string;
   onRefresh: () => void;
   onViewReport: (item: InterviewSessionSummary) => void;
+  onViewRecord: (item: InterviewSessionSummary) => void;
   onResume: (item: InterviewSessionSummary) => void;
   onExport: (sessionId: string, format: "markdown" | "pdf") => void;
 }) {
@@ -1120,7 +1903,7 @@ function HistoryPage(props: {
                 <p>{item.jd_preview}</p>
                 <div className="history-meta">
                   <span>{modeName(item.mode)}</span>
-                  <span>{item.assessment_count} 次回答</span>
+                  <span>{item.assessment_count} 条评价</span>
                   {item.question_count ? <span>{item.question_count} 道题</span> : null}
                   <span>{formatSessionTime(item.updated_at || item.created_at)}</span>
                 </div>
@@ -1141,6 +1924,10 @@ function HistoryPage(props: {
               </div>
 
               <div className="history-actions">
+                <button className="secondary-button" onClick={() => props.onViewRecord(item)} type="button">
+                  <MessageSquareText size={16} />
+                  查看记录
+                </button>
                 {item.has_report ? (
                   <>
                     <button className="primary-small" onClick={() => props.onViewReport(item)} type="button">
@@ -1172,12 +1959,63 @@ function HistoryPage(props: {
   );
 }
 
+function KnowledgePage(props: {
+  documents: KnowledgeDocument[];
+  release: KnowledgeRelease | null;
+  error: string;
+  onReview: (documentId: string, status: "approved" | "rejected") => void;
+  onPublish: () => void;
+}) {
+  return (
+    <section className="report-layout">
+      <div className="report-hero">
+        <div>
+          <span className="eyebrow">管理员知识审核</span>
+          <h1>候选资料与不可变发布</h1>
+          <p>只有审核通过的公共资料会进入新发布版本；构建失败不会切换当前版本。</p>
+        </div>
+        <button className="primary-small" onClick={props.onPublish}>
+          <Play size={16} /> 构建并发布
+        </button>
+      </div>
+      {props.error && <div className="error-callout"><AlertCircle size={16} />{props.error}</div>}
+      {props.release && (
+        <div className={props.release.status === "failed" ? "error-callout" : "signal-strip"}>
+          发布 {props.release.release_id.slice(0, 8)}：{props.release.status}
+          {props.release.error ? ` · ${props.release.error}` : ""}
+        </div>
+      )}
+      <div className="report-grid">
+        <section className="report-section span-2">
+          <h2>待审核候选</h2>
+          <div className="highlight-list">
+            {props.documents.map((document) => (
+              <article key={document.document_id}>
+                <strong>{document.title}</strong>
+                <p>{document.content.slice(0, 360)}</p>
+                {document.source_url && <small>{document.source_url}</small>}
+                <div className="report-actions">
+                  <button className="primary-small" onClick={() => props.onReview(document.document_id, "approved")}>批准</button>
+                  <button className="danger-button" onClick={() => props.onReview(document.document_id, "rejected")}>拒绝</button>
+                </div>
+              </article>
+            ))}
+            {!props.documents.length && <p>当前没有待审核候选资料。</p>}
+          </div>
+        </section>
+      </div>
+    </section>
+  );
+}
+
 function sessionStatusName(status: InterviewSessionSummary["status"]) {
   const map: Record<InterviewSessionSummary["status"], string> = {
     pending: "待开始",
     analyzing: "分析中",
     interviewing: "面试中",
     evaluating: "评估中",
+    pausing: "暂停中",
+    paused: "已暂停",
     completed: "已完成",
     failed: "失败",
   };
@@ -1235,6 +2073,9 @@ function InterviewPage(props: {
   transcriptRef: RefObject<HTMLDivElement | null>;
   onSubmitAnswer: (event: FormEvent) => void;
   onStop: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  onRetry: () => void;
   onReconnect: () => void;
   onBack: () => void;
 }) {
@@ -1306,6 +2147,17 @@ function InterviewPage(props: {
             </p>
           </div>
           <div className="interview-actions">
+            {props.stage === "paused" || props.stage === "pausing" ? (
+              <button className="secondary-button" onClick={props.onResume} disabled={props.stage === "pausing"}>
+                <Play size={16} />
+                恢复
+              </button>
+            ) : (
+              <button className="secondary-button" onClick={props.onPause}>
+                <Pause size={16} />
+                暂停
+              </button>
+            )}
             {props.connection !== "open" && (
               <button className="secondary-button" onClick={props.onReconnect}>
                 <RotateCcw size={16} />
@@ -1322,7 +2174,13 @@ function InterviewPage(props: {
         {props.error && (
           <div className="error-callout">
             <AlertCircle size={16} />
-            {props.error}
+            <span>{props.error}</span>
+            {props.connection === "open" && (
+              <button className="secondary-button" onClick={props.onRetry}>
+                <RotateCcw size={15} />
+                重试失败步骤
+              </button>
+            )}
           </div>
         )}
 
@@ -1368,6 +2226,45 @@ function InterviewPage(props: {
   );
 }
 
+function TranscriptRecordPage(props: {
+  sessionId: string;
+  messages: ChatItem[];
+  report: InterviewReport | null;
+  onBack: () => void;
+  onViewReport: () => void;
+}) {
+  return (
+    <section className="report-layout">
+      <div className="report-hero">
+        <button className="ghost-button" onClick={props.onBack}>
+          <ArrowLeft size={16} /> 返回历史
+        </button>
+        <div>
+          <span className="eyebrow">完整面试记录</span>
+          <h1>会话 {props.sessionId.slice(0, 8)}</h1>
+          <p>包含 AI 主问题、追问和你的回答；待重试回答也会保留。</p>
+        </div>
+        {props.report ? (
+          <button className="primary-small" onClick={props.onViewReport}>
+            <FileText size={16} /> 查看报告
+          </button>
+        ) : null}
+      </div>
+      <div className="transcript">
+        {props.messages.map((message) => (
+          <article className={`message ${message.role}`} key={message.id}>
+            <div className="avatar">{message.role === "candidate" ? <User size={16} /> : <Bot size={16} />}</div>
+            <div className="bubble">
+              {message.meta ? <span className="message-meta">{message.meta}</span> : null}
+              <p>{message.content}</p>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ReportPage(props: {
   report: InterviewReport;
   mode: InterviewMode;
@@ -1376,10 +2273,18 @@ function ReportPage(props: {
   onRestart: () => void;
   onBackToInterview: () => void;
   onExport: (sessionId: string, format: "markdown" | "pdf") => void;
+  onRepractice?: (skills: string[]) => void;
+  weakSkills: Array<{ skill_name: string; score: number }>;
+  repracticeNotice: string;
+  isPreparing: boolean;
+  error: string;
 }) {
+  const [selected, setSelected] = useState<string[]>([]);
+  const weakSkillNames = props.weakSkills.map((item) => item.skill_name).join("\n");
+  useEffect(() => { setSelected(weakSkillNames ? weakSkillNames.split("\n") : []); }, [props.sessionId, weakSkillNames]);
   const skillScores = props.report.skill_scores ?? [];
-  const grade = props.report.grade ?? "?";
-  const overall = props.report.overall_score ?? 0;
+  const grade = props.report.grade ?? null;
+  const overall = props.report.overall_score ?? null;
 
   return (
     <section className="report-layout">
@@ -1389,10 +2294,10 @@ function ReportPage(props: {
           返回面试记录
         </button>
         <div className="grade-lockup">
-          <span className={`grade grade-${grade}`}>{grade}</span>
+          <span className={`grade ${grade ? `grade-${grade}` : ""}`}>{grade ?? "—"}</span>
           <div>
             <span className="eyebrow">面试报告</span>
-            <h1>{overall.toFixed(1)} / 10</h1>
+            <h1>{overall === null ? "暂无可汇总分数" : `${overall.toFixed(1)} / 10`}</h1>
             <p>{props.report.overall_assessment}</p>
           </div>
         </div>
@@ -1412,9 +2317,25 @@ function ReportPage(props: {
             <RotateCcw size={16} />
             重新开始
           </button>
+          {props.onRepractice ? (
+            <button className="primary-small" disabled={props.isPreparing || !selected.length} onClick={() => props.onRepractice?.(selected)}>
+              <Sparkles size={16} />
+              针对薄弱项复练
+            </button>
+          ) : null}
         </div>
       </div>
 
+      {props.error && <div className="error-callout">{props.error}</div>}
+      {props.repracticeNotice && <p>{props.repracticeNotice}</p>}
+      {props.weakSkills.length > 0 && <fieldset>
+        <legend>选择复练技能（来自有效最终评价）</legend>
+        {props.weakSkills.map((item) => <label key={item.skill_name}>
+          <input type="checkbox" checked={selected.includes(item.skill_name)} onChange={(event) =>
+            setSelected((values) => event.target.checked ? [...values, item.skill_name] : values.filter((value) => value !== item.skill_name))} />
+          {item.skill_name} · {item.score}/10
+        </label>)}
+      </fieldset>}
       <div className="report-grid">
         {props.report.hiring_recommendation && (
           <section className="report-section span-2">
@@ -1461,6 +2382,19 @@ function ReportPage(props: {
         <ReportList title="优势表现" items={props.report.strengths ?? []} positive />
         <ReportList title="改进建议" items={props.report.improvements ?? []} />
 
+        {typeof props.report.coverage?.scored_questions === "number" ? (
+          <section className="report-section span-2">
+            <h2>考察覆盖</h2>
+            {props.report.total_questions != null && <p>最终评价题数：{props.report.total_questions}</p>}
+            <p>
+              已评分 {props.report.coverage.scored_questions ?? 0} 题，未评分 {props.report.coverage.unscored_questions ?? 0} 题。
+            </p>
+            {(props.report.coverage.uncovered_skills ?? []).length ? (
+              <p>未覆盖能力：{props.report.coverage.uncovered_skills?.join("、")}</p>
+            ) : null}
+          </section>
+        ) : null}
+
         {props.report.missed_knowledge?.length ? (
           <section className="report-section span-2">
             <h2>遗漏知识点</h2>
@@ -1469,7 +2403,7 @@ function ReportPage(props: {
                 <details key={item.question}>
                   <summary>
                     <span>{item.question}</span>
-                    <strong>{item.score}/10</strong>
+                    <strong>{item.score == null ? "未评分" : `${item.score}/10`}</strong>
                   </summary>
                   <ul>
                     {item.missed_points.map((point) => (
@@ -1492,6 +2426,22 @@ function ReportPage(props: {
                   <CheckCircle2 size={16} />
                   {item}
                 </span>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        {props.messages.length ? (
+          <section className="report-section span-2">
+            <h2>完整面试记录</h2>
+            <div className="transcript">
+              {props.messages.map((message) => (
+                <article className={`message ${message.role}`} key={message.id}>
+                  <div className="bubble">
+                    <strong>{message.role === "candidate" ? "我的回答" : message.role === "interviewer" ? "AI 面试官" : "系统"}</strong>
+                    <p>{message.content}</p>
+                  </div>
+                </article>
               ))}
             </div>
           </section>

@@ -33,19 +33,21 @@ async def check_rate_limit(
     identity: str,
     limit: int,
     window_seconds: int,
+    *,
+    require_backend: bool = False,
 ) -> RateLimitResult:
     """Check a fixed-window limit with INCR + EXPIRE.
 
-    Redis errors fail open because rate limiting should protect the demo service
-    without taking down the interview flow.
+    Legacy interview calls fail open; preparation explicitly requires the
+    backend and rejects admission when Redis or configured limits are unavailable.
     """
     if limit <= 0 or window_seconds <= 0:
-        return RateLimitResult(True, limit, 0, 0, "")
+        return RateLimitResult(not require_backend, limit, 0, 60, "")
 
     client = await get_redis()
     key = _key(name, identity, window_seconds)
     if client is None:
-        return RateLimitResult(True, limit, limit, 0, key)
+        return RateLimitResult(not require_backend, limit, 0, window_seconds, key)
 
     try:
         count = await client.incr(key)
@@ -62,5 +64,5 @@ async def check_rate_limit(
             key=key,
         )
     except Exception:
-        logger.warning("Redis rate limit failed open: name=%s", name, exc_info=True)
-        return RateLimitResult(True, limit, limit, 0, key)
+        logger.warning("Redis rate limit unavailable: name=%s", name)
+        return RateLimitResult(not require_backend, limit, 0, window_seconds, key)

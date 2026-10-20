@@ -8,6 +8,8 @@ from typing import Any
 
 from app.models.interview import AnswerAssessment, ChatMessage, InterviewSession
 from app.models.resume import ResumeParseResult
+from app.models.preparation import AssessmentTarget
+from app.models.evidence import EvidenceAssessment, EvidenceChunk
 from app.services.database import get_pool, session_store_enabled
 
 logger = logging.getLogger(__name__)
@@ -17,6 +19,15 @@ logger = logging.getLogger(__name__)
 class PersistedSession:
     session: InterviewSession
     mode: str
+    preparation_case_id: str | None = None
+    assessment_targets: list[AssessmentTarget] | None = None
+    evidence_chunks: dict[str, list[EvidenceChunk]] | None = None
+    evidence_assessments: dict[str, EvidenceAssessment] | None = None
+    pending_answers: dict[str, dict[str, Any]] | None = None
+    analysis_snapshot: dict[str, Any] | None = None
+    material_revision: int | None = None
+    knowledge_release_id: str | None = None
+    operation_state: dict[str, Any] | None = None
     resume_text: str = ""
     resume_parse_result: ResumeParseResult | None = None
     graph_started: bool = False
@@ -27,6 +38,8 @@ class PersistedSession:
     created_at: Any | None = None
     updated_at: Any | None = None
     completed_at: Any | None = None
+    completion_reason: str | None = None
+    paused_at: Any | None = None
 
 
 def _dump(value: Any) -> Any:
@@ -51,6 +64,7 @@ def _session_from_row(row: dict[str, Any]) -> PersistedSession:
     session = InterviewSession(
         session_id=row["session_id"],
         user_id=row["user_id"],
+        preparation_case_id=row.get("preparation_case_id"),
         jd_text=row["jd_text"],
         status=row["status"],
         current_question_index=row.get("current_question_index") or 0,
@@ -68,6 +82,24 @@ def _session_from_row(row: dict[str, Any]) -> PersistedSession:
     return PersistedSession(
         session=session,
         mode=row["mode"],
+        preparation_case_id=row.get("preparation_case_id"),
+        assessment_targets=[
+            AssessmentTarget.model_validate(item)
+            for item in (row.get("assessment_targets") or [])
+        ],
+        evidence_chunks={
+            key: [EvidenceChunk.model_validate(item) for item in values]
+            for key, values in (row.get("evidence_chunks") or {}).items()
+        },
+        evidence_assessments={
+            key: EvidenceAssessment.model_validate(value)
+            for key, value in (row.get("evidence_assessments") or {}).items()
+        },
+        pending_answers=row.get("pending_answers") or {},
+        analysis_snapshot=row.get("analysis_snapshot") or {},
+        material_revision=row.get("material_revision"),
+        knowledge_release_id=row.get("knowledge_release_id"),
+        operation_state=row.get("operation_state") or {},
         resume_text=row.get("resume_text") or "",
         resume_parse_result=resume_parse_result,
         graph_started=bool(row.get("graph_started")),
@@ -78,6 +110,8 @@ def _session_from_row(row: dict[str, Any]) -> PersistedSession:
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
         completed_at=row.get("completed_at"),
+        completion_reason=row.get("completion_reason"),
+        paused_at=row.get("paused_at"),
     )
 
 
@@ -92,6 +126,17 @@ async def save_session_record(
     persisted_assessment_count: int = 0,
     final_memory_saved: bool = False,
     error_message: str | None = None,
+    preparation_case_id: str | None = None,
+    assessment_targets: list[AssessmentTarget] | None = None,
+    evidence_chunks: dict[str, list[EvidenceChunk]] | None = None,
+    evidence_assessments: dict[str, EvidenceAssessment] | None = None,
+    pending_answers: dict[str, dict[str, Any]] | None = None,
+    analysis_snapshot: dict[str, Any] | None = None,
+    material_revision: int | None = None,
+    knowledge_release_id: str | None = None,
+    operation_state: dict[str, Any] | None = None,
+    completion_reason: str | None = None,
+    paused_at: Any | None = None,
 ) -> None:
     """Upsert one interview session metadata row."""
     if not session_store_enabled():
@@ -110,6 +155,15 @@ async def save_session_record(
             INSERT INTO interview_sessions (
                 session_id,
                 user_id,
+                preparation_case_id,
+                assessment_targets,
+                evidence_chunks,
+                evidence_assessments,
+                pending_answers,
+                analysis_snapshot,
+                material_revision,
+                knowledge_release_id,
+                operation_state,
                 mode,
                 jd_text,
                 max_follow_ups,
@@ -125,11 +179,22 @@ async def save_session_record(
                 persisted_assessment_count,
                 final_memory_saved,
                 error_message,
-                completed_at
+                completed_at,
+                completion_reason,
+                paused_at
             )
             VALUES (
                 %(session_id)s,
                 %(user_id)s,
+                %(preparation_case_id)s,
+                %(assessment_targets)s,
+                %(evidence_chunks)s,
+                %(evidence_assessments)s,
+                %(pending_answers)s,
+                %(analysis_snapshot)s,
+                %(material_revision)s,
+                %(knowledge_release_id)s,
+                %(operation_state)s,
                 %(mode)s,
                 %(jd_text)s,
                 %(max_follow_ups)s,
@@ -145,10 +210,21 @@ async def save_session_record(
                 %(persisted_assessment_count)s,
                 %(final_memory_saved)s,
                 %(error_message)s,
-                {completed_expr}
+                {completed_expr},
+                %(completion_reason)s,
+                %(paused_at)s
             )
             ON CONFLICT (session_id) DO UPDATE SET
                 user_id = EXCLUDED.user_id,
+                preparation_case_id = EXCLUDED.preparation_case_id,
+                assessment_targets = EXCLUDED.assessment_targets,
+                evidence_chunks = EXCLUDED.evidence_chunks,
+                evidence_assessments = EXCLUDED.evidence_assessments,
+                pending_answers = EXCLUDED.pending_answers,
+                analysis_snapshot = EXCLUDED.analysis_snapshot,
+                material_revision = EXCLUDED.material_revision,
+                knowledge_release_id = EXCLUDED.knowledge_release_id,
+                operation_state = EXCLUDED.operation_state,
                 mode = EXCLUDED.mode,
                 jd_text = EXCLUDED.jd_text,
                 max_follow_ups = EXCLUDED.max_follow_ups,
@@ -169,11 +245,22 @@ async def save_session_record(
                     WHEN EXCLUDED.status = 'completed'
                     THEN COALESCE(interview_sessions.completed_at, NOW())
                     ELSE interview_sessions.completed_at
-                END
+                END,
+                completion_reason = EXCLUDED.completion_reason,
+                paused_at = EXCLUDED.paused_at
             """,
             {
                 "session_id": session.session_id,
                 "user_id": session.user_id,
+                "preparation_case_id": preparation_case_id,
+                "assessment_targets": Jsonb(_dump(assessment_targets or [])),
+                "evidence_chunks": Jsonb(_dump(evidence_chunks or {})),
+                "evidence_assessments": Jsonb(_dump(evidence_assessments or {})),
+                "pending_answers": Jsonb(_dump(pending_answers or {})),
+                "analysis_snapshot": Jsonb(_dump(analysis_snapshot or {})),
+                "material_revision": material_revision,
+                "knowledge_release_id": knowledge_release_id,
+                "operation_state": Jsonb(_dump(operation_state or {})),
                 "mode": mode,
                 "jd_text": session.jd_text,
                 "max_follow_ups": session.max_follow_ups,
@@ -191,6 +278,8 @@ async def save_session_record(
                 "persisted_assessment_count": persisted_assessment_count,
                 "final_memory_saved": final_memory_saved,
                 "error_message": error_message,
+                "completion_reason": completion_reason,
+                "paused_at": paused_at,
             },
         )
 
